@@ -1,0 +1,13 @@
+# Variáveis sensíveis (nunca enviar para o GitHub)
+.env
+*.env.local
+
+# Banco SQLite local e arquivos WAL (>100MB - no Railway usar Volume /data)
+locar.db
+locar.db-wal
+locar.db-shm
+
+# Cache Python e temporários
+__pycache__/
+*.pyc
+scratch/
