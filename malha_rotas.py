@@ -24,7 +24,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import database as db
@@ -36,131 +36,562 @@ DIR_MALHA_TRANSITAVEIS = "Malhas Viárias - Somente Transitáveis"
 DIR_MALHA_COMPLETA = "Malhas Viárias - Completas"
 
 DIAS_SEMANA = {"SEG": 0, "TER": 1, "QUA": 2, "QUI": 3, "SEX": 4, "SAB": 5, "DOM": 6}
+ORDEM_DIAS = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"]
+NOMES_DIAS_PT = [
+    "Segunda-feira",
+    "Terça-feira",
+    "Quarta-feira",
+    "Quinta-feira",
+    "Sexta-feira",
+    "Sábado",
+    "Domingo",
+]
 DIAS_ALIASES = {
-    "SEGUNDA": "SEG", "TERCA": "TER", "QUARTA": "QUA", "QUINTA": "QUI",
-    "SEXTA": "SEX", "SABADO": "SAB", "DOMINGO": "DOM",
+    "SEGUNDA": "SEG",
+    "TERCA": "TER",
+    "QUARTA": "QUA",
+    "QUINTA": "QUI",
+    "SEXTA": "SEX",
+    "SABADO": "SAB",
+    "DOMINGO": "DOM",
 }
+_NUM_DIA_INLOG = {"2": "SEG", "3": "TER", "4": "QUA", "5": "QUI", "6": "SEX", "7": "SAB"}
 
-_RE_CODIGO = re.compile(r"\b(SC[A-Z]{1,6}|FEIRA)\s*0*(\d{1,4})\b")
+_PREFIXOS_CONHECIDOS_ORDENADOS = (
+    "SCDOMD", "SCDOMN", "SCDOM",
+    "SCDIST", "SCFEIRA", "SCRURAL", "SCEXTRA",
+    "SCSBD", "SCSCD",
+    "SCAD", "SCDD", "SCDN", "SCDM", "SCDV",
+    "SCPD", "SCPN", "SCPM", "SCPV",
+    "SCID", "SCIN", "SCIM", "SCIV",
+)
+
+_RE_CODIGO = re.compile(
+    r"\b(SCDOMD|SCDOMN|SCDOM|SCDIST|SCFEIRA|SCRURAL|SCEXTRA|SCSBD|SCSCD|SC[A-Z]{1,6}|FEIRA)\s*0*(\d{1,4})\b"
+)
+_RE_PREF_SEM_NUM = re.compile(
+    r"\b(SCDOMD|SCDOMN|SCDOM|SCDIST|SCFEIRA|SCRURAL|SCEXTRA|SCSBD|SCSCD|SC[A-Z]{1,6})\b"
+)
+_RE_QZ = re.compile(
+    r"\b((?:(?:SEG|TER|QUA|QUI|SEX|SAB|DOM)\s*(?:E\s+)?)+)QZ\s+(\d{2})[./-](\d{2})[./-](\d{4})\b"
+)
+_RE_ORDINAL = re.compile(
+    r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\s+((?:[1-5L](?:\s+|$))+)"
+)
+_RE_INTERVALO_A = re.compile(
+    r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\s+A\s+(SEG|TER|QUA|QUI|SEX|SAB|DOM)\b"
+)
+_RE_DIA_SIGLA = re.compile(r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\b")
 
 
-# ==============================================================================
-# CLASSIFICAÇÃO PADRÃO DE SIGLAS (PAR / ÍMPAR / DIURNO / NOTURNO)
-# ==============================================================================
-def classificar_setor_sigla(setor_nome: Any) -> Dict[str, Any]:
+def _parse_data_iso(data_iso: Any) -> Optional[date]:
+    if isinstance(data_iso, datetime):
+        return data_iso.date()
+    if isinstance(data_iso, date):
+        return data_iso
+    try:
+        return datetime.strptime(str(data_iso)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _normalizar_trecho_agenda(texto: Any) -> str:
     """
-    Analisa a sigla padrão do setor conforme regra das 4 letras:
-      - 1ª e 2ª letras: 'SC' (Setor de Coleta - Fixo)
-      - 3ª letra: 'P' (Par) ou 'I' (Ímpar) (ou 'D' Diário)
-      - 4ª letra: 'D' (Diurno) ou 'N' (Noturno)
-
-    Regra de frequência:
-      - PAR (3ª letra 'P', ex: SCPD, SCPN): Segunda, Quarta e Sexta (wd in 0, 2, 4)
-      - ÍMPAR (3ª letra 'I', ex: SCID, SCIN): Terça, Quinta e Sábado (wd in 1, 3, 5)
-      - DIÁRIO (3ª letra 'D', ex: SCDD, SCDN): Segunda a Sábado
-      - DOMINGO (ex: FEIRA, DOM): Domingo
+    Normaliza um texto para análise de nomenclatura/agenda preservando datas QZ
+    e separando prefixo de número (ex.: 'SCDD04 3E7' -> 'SCDD 04 TER E SAB').
     """
-    s = str(setor_nome or "").upper().strip()
-    if "DOM" in s or "FEIRA" in s:
+    raw = str(texto or "").upper().strip()
+    raw = re.sub(r"\.GPKG$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^ROTA[_\s-]*FINAL[_\s-]*", "", raw, flags=re.IGNORECASE)
+    t = normalizar_ascii(raw)
+    t = re.sub(r"([A-Z])(\d)", r"\1 \2", t)
+    t = re.sub(r"\b(\d+)([A-Z]+)", r"\1 \2", t)
+
+    # Mapeia variações descritivas da Inlog (ex.: SC DISTRITO QUINTA 09 -> SCDIST 09 QUI)
+    t = re.sub(r"\bSC\s+DISTRITO\b", "SCDIST", t)
+    t = re.sub(r"\bDISTRI(?:TO)?\b", "SCDIST", t)
+    t = re.sub(r"\bDOMINGO\s+FEIRA\b", "SCFEIRA", t)
+    # Expande nomes de dias por extenso preservando datas DD.MM.AAAA
+    for longo, curto in DIAS_ALIASES.items():
+        t = re.sub(rf"\b{longo}(?:\s*-?\s*FEIRA)?\b", curto, t)
+
+    # Expande abreviações numéricas Inlog de dias (ex.: 2E4 -> SEG E QUA, 2A6 -> SEG A SEX, 3E7 -> TER E SAB)
+    def _repl_num_op(m: re.Match) -> str:
+        d1 = _NUM_DIA_INLOG.get(m.group(1), m.group(1))
+        op = m.group(2)
+        d2 = _NUM_DIA_INLOG.get(m.group(3), m.group(3))
+        return f"{d1} {op} {d2}"
+
+    t = re.sub(r"\b([2-7])\s*([AE])\s*([2-7])\b", _repl_num_op, t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _extrair_bloco_identificacao_e_sufixo(texto_norm: str) -> Tuple[str, Optional[int], str, str]:
+    """
+    Extrai (prefixo, numero, sufixo_agenda, trecho_completo_identificado).
+    Isola o sufixo da agenda antes da descrição de bairros/ruas (' - BAIRRO...').
+    """
+    # Normaliza caso Inlog "SCDIST <DIA> <NUM>" -> "SCDIST <NUM> <DIA>"
+    texto_norm = re.sub(
+        r"\b(SCDIST|SCFEIRA|SCRURAL|SCEXTRA)\s+(SEG|TER|QUA|QUI|SEX|SAB|DOM)\s+0*(\d{1,4})\b",
+        r"\1 \3 \2",
+        texto_norm,
+    )
+
+    m = _RE_CODIGO.search(texto_norm)
+    if not m:
+        # Tenta localizar prefixo sem número (ex.: VITORIA - SCDOMD - DOMICILIAR)
+        m2 = _RE_PREF_SEM_NUM.search(texto_norm)
+        if not m2:
+            # Fallback para descrições antigas sem SC* (ex.: "CARUARU - DOMINGO FEIRA 74 MANHA - CENTRO")
+            partes_dash = [p.strip() for p in texto_norm.split(" - ") if p.strip()]
+            bloco = partes_dash[1] if len(partes_dash) >= 2 else texto_norm
+            return "OUTRO", None, bloco, bloco
+        pref = m2.group(1)
+        cauda = texto_norm[m2.end():].strip()
+        sufixo = cauda.split(" - ")[0].strip() if " - " in cauda else cauda
+        return pref, None, sufixo, f"{pref} {sufixo}".strip()
+
+    pref = m.group(1)
+    if pref == "FEIRA":
+        pref = "SCFEIRA"
+    num = int(m.group(2))
+    cauda = texto_norm[m.end():].strip()
+
+    # Se houver " - " logo após o código (ex: "SCDIST 10 - TER E SAB" ou "SCID 54 - BOSQUE DA SAUDE - DOM BOSCO"),
+    # pega apenas o primeiro bloco caso o resto após " - " seja só agenda, senão pega antes do " - "
+    if cauda.startswith("- "):
+        prox_blocos = [p.strip() for p in cauda[2:].split(" - ") if p.strip()]
+        if prox_blocos:
+            primeiro = prox_blocos[0]
+            tokens_p = [tok for tok in primeiro.split() if tok not in ("E", "A", "QZ")]
+            # Só considera bloco após "-" como sufixo de agenda se ele for composto apenas de tokens de agenda
+            if tokens_p and all(
+                tok in DIAS_SEMANA or tok in ("1", "2", "3", "4", "5", "L") or re.match(r"^\d{2}[./-]\d{2}[./-]\d{4}$", tok)
+                for tok in tokens_p
+            ):
+                sufixo = primeiro
+            else:
+                sufixo = ""
+        else:
+            sufixo = ""
+    elif " - " in cauda:
+        sufixo = cauda.split(" - ")[0].strip()
+    else:
+        sufixo = cauda
+
+    return pref, num, sufixo, f"{pref} {num} {sufixo}".strip()
+
+
+def _classificar_turno(pref: str, texto_norm: str, turno_forcado: Optional[str] = None) -> str:
+    if turno_forcado:
+        tf = normalizar_ascii(turno_forcado)
+        if "NOTUR" in tf or tf == "N":
+            return "NOTURNO"
+        if "DIUR" in tf or tf == "D":
+            return "DIURNO"
+
+    if pref in ("SCDOMN", "SCDN", "SCPN", "SCIN", "SCDM", "SCPM", "SCIM"):
+        return "NOTURNO"
+    if pref in ("SCDOMD", "SCDD", "SCPD", "SCID", "SCAD", "SCSBD", "SCSCD", "SCPV", "SCIV", "SCDV"):
+        return "DIURNO"
+    if re.search(r"\b(NOTURNO|NOTURNA|NOITE)\b", texto_norm):
+        return "NOTURNO"
+    if re.search(r"\b(DIURNO|DIURNA|MANHA|TARDE)\b", texto_norm):
+        return "DIURNO"
+
+    # Padrão de heurística para 4ª letra (SCxN / SCxM -> NOTURNO)
+    if pref.startswith("SC") and len(pref) == 4 and pref not in ("SCDOM",):
+        if pref[-1] in ("N", "M"):
+            return "NOTURNO"
+        if pref[-1] in ("D", "V"):
+            return "DIURNO"
+
+    # SCDOM 28 / 29 / 38 (Olinda Noturno) sem palavra NOTURNO no apelido
+    if pref == "SCDOM":
+        m_num = re.search(r"\bSCDOM\s*0*(\d+)\b", texto_norm)
+        if m_num and int(m_num.group(1)) in (28, 29, 38):
+            return "NOTURNO"
+
+    return "DIURNO"
+
+
+def _expandir_intervalo_dias(d1: str, d2: str) -> List[str]:
+    i1 = DIAS_SEMANA[d1]
+    i2 = DIAS_SEMANA[d2]
+    if i1 <= i2:
+        return [ORDEM_DIAS[i] for i in range(i1, i2 + 1)]
+    return [ORDEM_DIAS[i] for i in list(range(i1, 7)) + list(range(0, i2 + 1))]
+
+
+def _ordinal_dia_no_mes(dt: date) -> Tuple[int, bool]:
+    nth = (dt.day - 1) // 7 + 1
+    eh_ultimo = (dt + timedelta(days=7)).month != dt.month
+    return nth, eh_ultimo
+
+
+def _formatar_ordinal_pt(dia_sigla: str, ords: List[str]) -> str:
+    mapa = {"1": "1º", "2": "2º", "3": "3º", "4": "4º", "5": "5º", "L": "Últ."}
+    nomes = [mapa.get(o, o) for o in ords]
+    return f"{'/'.join(nomes)} {dia_sigla}"
+
+
+def analisar_nomenclatura_setor(
+    setor_nome: Any,
+    contrato_id: Optional[str] = None,
+    turno_forcado: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Analisa a nomenclatura completa de um setor seguindo estritamente o Manual de Rotas e Setores:
+      1. Sufixos explícitos:
+         - Quinzenal: `<DIA> QZ DD.MM.AAAA` (ex.: SEG QZ 06.04.2026, SAB QZ 04.04.2026)
+         - Ordinal mensal: `SAB 1`, `TER 2`, `QUI 3`, `SEX 4`, `SAB L`, `TER 1 3`, `QUA L SAB 3 L`
+         - Intervalo consecutivo com 'A': `SEG A SEX`, `SEG A SAB`, `TER A QUI`
+         - Combinações com espaço ou 'E' / Dias individuais: `SEG`, `TER`, `SEG QUA SEX`, `TER E QUI`, `TER QUI SAB`
+      2. Padrão por prefixo (quando nenhum sufixo de dia é informado):
+         - `SCD*` (exceto SCDIST*, SCDOM*): Diário (todos os dias)
+         - `SCP*`: Dias de frequência Par (Seg, Qua, Sex — 2ª, 4ª, 6ª)
+         - `SCI*`: Dias de frequência Ímpar (Ter, Qui, Sáb — 3ª, 5ª, Sáb)
+         - `SCDOM*`: Apenas Domingos
+         - `SCA*`, `SCS*`, `SCDIST*`, `SCFEIRA*`, `SCRURAL*`, `SCEXTRA*`: Sem agenda padrão se não houver sufixo
+    """
+    texto_norm = _normalizar_trecho_agenda(setor_nome)
+    pref, num, sufixo, ident_str = _extrair_bloco_identificacao_e_sufixo(texto_norm)
+
+    # Se vier apenas prefixo+num da Inlog sem sufixo e tivermos contrato_id, tenta enriquecer pelo arquivo de rota
+    turno_arquivo = None
+    if contrato_id and pref != "OUTRO" and num is not None:
+        codigo_canon = ("FEIRA" if pref == "SCFEIRA" else pref, num)
+        rotas_cidade = listar_rotas_cidade(contrato_id)
+        cands_rota = [r for r in rotas_cidade if r.get("codigo") == codigo_canon]
+        if len(cands_rota) == 1:
+            turno_arquivo = cands_rota[0].get("turno")
+            if not sufixo:
+                _, _, sufixo_rota, _ = _extrair_bloco_identificacao_e_sufixo(
+                    _normalizar_trecho_agenda(cands_rota[0].get("apelido", ""))
+                )
+                if sufixo_rota:
+                    sufixo = sufixo_rota
+
+    turno = _classificar_turno(pref, texto_norm, turno_forcado=turno_forcado or turno_arquivo)
+
+    # Limpa pontuação solta no sufixo mantendo pontos/barras de datas
+    sufixo_clean = re.sub(r"[,;()]+", " ", sufixo)
+    sufixo_clean = re.sub(r"\s+", " ", sufixo_clean).strip()
+
+    # 1. Quinzenal (`<DIAS> QZ <DD.MM.AAAA>`)
+    m_qz = _RE_QZ.search(sufixo_clean)
+    if m_qz:
+        dias_raw = _RE_DIA_SIGLA.findall(m_qz.group(1))
+        dias_ord = sorted(set(dias_raw), key=lambda d: DIAS_SEMANA[d])
+        dd, mm, yyyy = int(m_qz.group(2)), int(m_qz.group(3)), int(m_qz.group(4))
+        try:
+            ref_dt = date(yyyy, mm, dd)
+        except ValueError:
+            ref_dt = None
+        rotulo_data = f"{dd:02d}.{mm:02d}.{yyyy:04d}"
         return {
-            "sigla": "DOM",
-            "l3": "DOM",
-            "l4": "",
-            "freq": "DOMINGO",
-            "turno": "DIURNO",
-            "descricao": "Coletas de Domingo / Feiras",
-        }
-    m = re.search(r"\bSC([A-Z])([A-Z])(?:\s*|\b|\d)", s)
-    if m:
-        l3 = m.group(1)
-        l4 = m.group(2)
-        freq = "PAR" if l3 == "P" else ("IMPAR" if l3 == "I" else ("DIARIO" if l3 == "D" else "OUTRO"))
-        turno = "DIURNO" if l4 in ("D", "M") else ("NOTURNO" if l4 in ("N", "V") else "OUTRO")
-        desc = f"Setor Coleta {'Par' if freq == 'PAR' else ('Ímpar' if freq == 'IMPAR' else 'Diário')} {'Diurno' if turno == 'DIURNO' else 'Noturno'}"
-        return {
-            "sigla": f"SC{l3}{l4}",
-            "l3": l3,
-            "l4": l4,
-            "freq": freq,
+            "prefixo": pref,
+            "numero": num,
             "turno": turno,
-            "descricao": desc,
+            "regra_tipo": "QUINZENAL",
+            "frequencia": "QUINZENAL",
+            "dias_semana": dias_ord,
+            "ordinais": {},
+            "qz_ref": ref_dt.isoformat() if ref_dt else None,
+            "tem_sufixo_explicito": True,
+            "agenda_rotulo": f"{'/'.join(dias_ord)} QZ {rotulo_data}",
+            "descricao": f"Quinzenal ({'/'.join(dias_ord)}) ref. {dd:02d}/{mm:02d}/{yyyy:04d}",
         }
+
+    # 2. Ordinal mensal (`SAB 1`, `TER 2`, `QUI 3`, `SEX 4`, `SAB L`, `TER 1 3`, `QUA L SAB 3 L`)
+    ord_matches = list(_RE_ORDINAL.finditer(sufixo_clean))
+    if ord_matches:
+        ord_map: Dict[str, List[str]] = {}
+        partes_rotulo: List[str] = []
+        for om in ord_matches:
+            d_tok = om.group(1)
+            ords = re.findall(r"[1-5L]", om.group(2))
+            if d_tok not in ord_map:
+                ord_map[d_tok] = []
+            for o in ords:
+                if o not in ord_map[d_tok]:
+                    ord_map[d_tok].append(o)
+        # Caso existam dias extras no sufixo fora dos blocos ordinais (sem número ordinal)
+        sufixo_sem_ord = _RE_ORDINAL.sub(" ", sufixo_clean)
+        dias_extra = [d for d in _RE_DIA_SIGLA.findall(sufixo_sem_ord) if d not in ord_map]
+        for d_tok, ords in ord_map.items():
+            partes_rotulo.append(_formatar_ordinal_pt(d_tok, ords))
+        for d_ext in dias_extra:
+            partes_rotulo.append(d_ext)
+        dias_ord = sorted(set(list(ord_map.keys()) + dias_extra), key=lambda d: DIAS_SEMANA[d])
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "ORDINAL",
+            "frequencia": "ORDINAL",
+            "dias_semana": dias_ord,
+            "ordinais": ord_map,
+            "dias_sem_ordinal": dias_extra,
+            "qz_ref": None,
+            "tem_sufixo_explicito": True,
+            "agenda_rotulo": " · ".join(partes_rotulo),
+            "descricao": f"Ordinal mensal: {' · '.join(partes_rotulo)}",
+        }
+
+    # 3. Intervalo consecutivo com "A" (`SEG A SEX`, `SEG A SAB`, `TER A QUI`)
+    int_matches = list(_RE_INTERVALO_A.finditer(sufixo_clean))
+    if int_matches:
+        dias_set: Set[str] = set()
+        for im in int_matches:
+            dias_set.update(_expandir_intervalo_dias(im.group(1), im.group(2)))
+        sufixo_sem_int = _RE_INTERVALO_A.sub(" ", sufixo_clean)
+        dias_set.update(_RE_DIA_SIGLA.findall(sufixo_sem_int))
+        dias_ord = sorted(dias_set, key=lambda d: DIAS_SEMANA[d])
+        rotulo = (
+            f"{int_matches[0].group(1)} A {int_matches[0].group(2)}"
+            if len(int_matches) == 1 and not _RE_DIA_SIGLA.findall(sufixo_sem_int)
+            else "/".join(dias_ord)
+        )
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "INTERVALO",
+            "frequencia": rotulo,
+            "dias_semana": dias_ord,
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": True,
+            "agenda_rotulo": rotulo,
+            "descricao": f"Intervalo de coleta: {' / '.join(dias_ord)}",
+        }
+
+    # 4. Combinações com espaço, "E" ou dia individual (`SEG`, `TER E SAB`, `SEG QUA SEX`, etc.)
+    dias_explicitos = _RE_DIA_SIGLA.findall(sufixo_clean)
+    if dias_explicitos:
+        dias_ord = sorted(set(dias_explicitos), key=lambda d: DIAS_SEMANA[d])
+        rotulo = (
+            " E ".join(dias_ord)
+            if (len(dias_ord) == 2 and re.search(r"\bE\b", sufixo_clean))
+            else "/".join(dias_ord)
+        )
+        freq = (
+            "PAR"
+            if dias_ord == ["SEG", "QUA", "SEX"]
+            else ("IMPAR" if dias_ord == ["TER", "QUI", "SAB"] else ("DOMINGO" if dias_ord == ["DOM"] else rotulo))
+        )
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "DIAS_FIXOS",
+            "frequencia": freq,
+            "dias_semana": dias_ord,
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": True,
+            "agenda_rotulo": rotulo,
+            "descricao": f"Dias fixos: {', '.join(dias_ord)}",
+        }
+
+    # 5. Padrão deduzido pelo prefixo do código (quando nenhum sufixo explícito foi informado)
+    if pref.startswith("SCDOM"):
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "PADRAO_DOMINGO",
+            "frequencia": "DOMINGO",
+            "dias_semana": ["DOM"],
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": False,
+            "agenda_rotulo": "DOM",
+            "descricao": "Apenas domingos (padrão SCDOM*)",
+        }
+
+    if pref.startswith("SCD") and not pref.startswith("SCDIST"):
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "PADRAO_DIARIO",
+            "frequencia": "DIARIO",
+            "dias_semana": ORDEM_DIAS[:],
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": False,
+            "agenda_rotulo": "DIÁRIO",
+            "descricao": "Diário — todos os dias (padrão SCD*)",
+        }
+
+    if pref.startswith("SCP"):
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "PADRAO_PAR",
+            "frequencia": "PAR",
+            "dias_semana": ["SEG", "QUA", "SEX"],
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": False,
+            "agenda_rotulo": "PAR (SEG/QUA/SEX)",
+            "descricao": "Frequência PAR — Seg/Qua/Sex (padrão SCP*)",
+        }
+
+    if pref.startswith("SCI"):
+        return {
+            "prefixo": pref,
+            "numero": num,
+            "turno": turno,
+            "regra_tipo": "PADRAO_IMPAR",
+            "frequencia": "IMPAR",
+            "dias_semana": ["TER", "QUI", "SAB"],
+            "ordinais": {},
+            "qz_ref": None,
+            "tem_sufixo_explicito": False,
+            "agenda_rotulo": "ÍMPAR (TER/QUI/SÁB)",
+            "descricao": "Frequência ÍMPAR — Ter/Qui/Sáb (padrão SCI*)",
+        }
+
+    # Prefixos especiais sem sufixo explícito (`SCA*`, `SCS*`, `SCDIST*`, `SCFEIRA*`, `SCRURAL*`, `SCEXTRA*`)
     return {
-        "sigla": "OUTRO",
-        "l3": "",
-        "l4": "",
-        "freq": "OUTRO",
-        "turno": "OUTRO",
-        "descricao": "Geral",
+        "prefixo": pref,
+        "numero": num,
+        "turno": turno,
+        "regra_tipo": "SEM_AGENDA_PADRAO",
+        "frequencia": "MANUAL",
+        "dias_semana": ORDEM_DIAS[:],
+        "ordinais": {},
+        "qz_ref": None,
+        "tem_sufixo_explicito": False,
+        "agenda_rotulo": "AGENDA MANUAL",
+        "descricao": "Sem agenda padrão definida no código",
     }
 
 
-def setor_visivel_na_data(setor_nome: Any, data_iso: str) -> bool:
+def classificar_setor_sigla(setor_nome: Any, contrato_id: Optional[str] = None) -> Dict[str, Any]:
+    """Compatibilidade com chamadas existentes: retorna o diagnóstico completo do setor."""
+    info = analisar_nomenclatura_setor(setor_nome, contrato_id=contrato_id)
+    pref = info["prefixo"]
+    l3 = pref[2] if (pref.startswith("SC") and len(pref) >= 4) else pref
+    l4 = pref[3] if (pref.startswith("SC") and len(pref) >= 4) else ""
+    return {
+        "sigla": pref,
+        "l3": l3,
+        "l4": l4,
+        "freq": info["frequencia"],
+        "regra_tipo": info["regra_tipo"],
+        "turno": info["turno"],
+        "agenda_rotulo": info["agenda_rotulo"],
+        "dias_semana": info["dias_semana"],
+        "descricao": info["descricao"],
+    }
+
+
+def setor_visivel_na_data(
+    setor_nome: Any,
+    data_iso: str,
+    contrato_id: Optional[str] = None,
+    turno_forcado: Optional[str] = None,
+) -> bool:
     """
-    Regra padrão de exibição para todas as cidades:
-    - Segunda, Quarta e Sexta (wd in 0, 2, 4): só exibe os setores PAR (3ª letra 'P').
-    - Terça, Quinta e Sábado (wd in 1, 3, 5): só exibe os setores ÍMPAR (3ª letra 'I').
-    - Domingo (wd == 6): só exibe setores de domingo.
-    - Setores diários (ex: SCDD, SCDN) são exibidos de segunda a sábado.
+    Avalia rigorosamente se o setor deve ser exibido e contabilizado na data consultada,
+    seguindo a nomenclatura oficial de sufixos, intervalos, combinações, ordinais mensais,
+    quinzenais (QZ) e padrões por prefixo.
     """
-    try:
-        dt = datetime.strptime(str(data_iso)[:10], "%Y-%m-%d")
-        wd = dt.weekday()
-    except Exception:
+    dt = _parse_data_iso(data_iso)
+    if dt is None:
         return True
 
-    info = classificar_setor_sigla(setor_nome)
-    freq = info["freq"]
+    nome_str = str(setor_nome or "").strip()
+    if not nome_str or nome_str.upper() == "S/S":
+        return True
 
-    if freq == "PAR":
-        return wd in (0, 2, 4)
-    elif freq == "IMPAR":
-        return wd in (1, 3, 5)
-    elif freq == "DOMINGO":
-        return wd == 6
-    elif freq == "DIARIO":
-        return wd in (0, 1, 2, 3, 4, 5)
-    else:
-        return wd in (0, 1, 2, 3, 4, 5)
+    info = analisar_nomenclatura_setor(nome_str, contrato_id=contrato_id, turno_forcado=turno_forcado)
+    regra = info["regra_tipo"]
+    dia_sigla = ORDEM_DIAS[dt.weekday()]
+
+    if regra == "QUINZENAL":
+        if dia_sigla not in info["dias_semana"]:
+            return False
+        ref_str = info.get("qz_ref")
+        if not ref_str:
+            return True
+        ref_dt = _parse_data_iso(ref_str)
+        if not ref_dt:
+            return True
+        dt_monday = dt - timedelta(days=dt.weekday())
+        ref_monday = ref_dt - timedelta(days=ref_dt.weekday())
+        semanas_diff = (dt_monday - ref_monday).days // 7
+        return (semanas_diff % 2) == 0
+
+    if regra == "ORDINAL":
+        if dia_sigla in info.get("dias_sem_ordinal", []):
+            return True
+        ords = info.get("ordinais", {}).get(dia_sigla)
+        if not ords:
+            return False
+        nth, eh_ultimo = _ordinal_dia_no_mes(dt)
+        return (str(nth) in ords) or ("L" in ords and eh_ultimo)
+
+    if regra in ("INTERVALO", "DIAS_FIXOS", "PADRAO_DOMINGO", "PADRAO_DIARIO", "PADRAO_PAR", "PADRAO_IMPAR"):
+        return dia_sigla in info["dias_semana"]
+
+    # SEM_AGENDA_PADRAO (ex.: SCA*, SCS*, SCDIST*, SCFEIRA*, SCRURAL*, SCEXTRA* sem sufixo)
+    return True
 
 
 def info_frequencia_data(data_iso: str) -> Dict[str, Any]:
-    """Retorna metadados operacionais da data selecionada para exibição no painel."""
-    try:
-        dt = datetime.strptime(str(data_iso)[:10], "%Y-%m-%d")
-        wd = dt.weekday()
-    except Exception:
+    """Retorna metadados operacionais completos da data selecionada para exibição no painel."""
+    dt = _parse_data_iso(data_iso)
+    if dt is None:
         return {"dia_semana": "", "frequencia": "TODOS", "rotulo": "Todos os setores"}
 
-    nomes_dias = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
-    dia_nome = nomes_dias[wd]
+    wd = dt.weekday()
+    dia_nome = NOMES_DIAS_PT[wd]
+    dia_sigla = ORDEM_DIAS[wd]
+    nth, eh_ultimo = _ordinal_dia_no_mes(dt)
+    ord_tag = f"{nth}º ({'último' if eh_ultimo else 'ordinário'})"
 
     if wd in (0, 2, 4):
         return {
             "weekday": wd,
             "dia_semana": dia_nome,
+            "dia_sigla": dia_sigla,
+            "ocorrencia_mes": nth,
+            "eh_ultima_ocorrencia": eh_ultimo,
             "frequencia": "PAR",
-            "siglas_esperadas": ["SCPD", "SCPN"],
-            "rotulo": f"{dia_nome} · Frequência PAR (SCPD / SCPN)",
-            "descricao": "Segunda, Quarta e Sexta exibem exclusivamente os setores PAR (3ª letra P)",
+            "siglas_esperadas": ["SCPD", "SCPN", "SCD*", dia_sigla],
+            "rotulo": f"{dia_nome} · Agenda {dia_sigla} / PAR (SCP*) + Diários (SCD*)",
+            "descricao": f"{dia_nome} ({ord_tag}): exibe setores com sufixo {dia_sigla}/QZ/Ordinal do dia, padrão PAR (SCP*) e Diários (SCD*).",
         }
     elif wd in (1, 3, 5):
         return {
             "weekday": wd,
             "dia_semana": dia_nome,
+            "dia_sigla": dia_sigla,
+            "ocorrencia_mes": nth,
+            "eh_ultima_ocorrencia": eh_ultimo,
             "frequencia": "IMPAR",
-            "siglas_esperadas": ["SCID", "SCIN"],
-            "rotulo": f"{dia_nome} · Frequência ÍMPAR (SCID / SCIN)",
-            "descricao": "Terça, Quinta e Sábado exibem exclusivamente os setores ÍMPAR (3ª letra I)",
+            "siglas_esperadas": ["SCID", "SCIN", "SCD*", dia_sigla],
+            "rotulo": f"{dia_nome} · Agenda {dia_sigla} / ÍMPAR (SCI*) + Diários (SCD*)",
+            "descricao": f"{dia_nome} ({ord_tag}): exibe setores com sufixo {dia_sigla}/QZ/Ordinal do dia, padrão ÍMPAR (SCI*) e Diários (SCD*).",
         }
     else:
         return {
             "weekday": wd,
             "dia_semana": dia_nome,
+            "dia_sigla": dia_sigla,
+            "ocorrencia_mes": nth,
+            "eh_ultima_ocorrencia": eh_ultimo,
             "frequencia": "DOMINGO",
-            "siglas_esperadas": ["DOM", "FEIRA"],
-            "rotulo": f"{dia_nome} · Coletas Especiais de Domingo",
-            "descricao": "Domingo exibe coletas de feiras e operações de domingo",
+            "siglas_esperadas": ["SCDOM*", "SCFEIRA DOM", "SCD*"],
+            "rotulo": f"{dia_nome} · Agenda DOM / SCDOM* + Diários (SCD*)",
+            "descricao": f"{dia_nome} ({ord_tag}): exibe setores de Domingo (DOM / SCDOM* / SCFEIRA DOM) e rotas Diárias sem restrição (SCD*).",
         }
 
 
@@ -215,7 +646,6 @@ def dir_rotas() -> Optional[str]:
     candidatos = [
         os.getenv("ROTAS_PLANEJADAS_DIR"),
         os.path.join(BASE_DIR, "Rotas Planejadas"),
-        os.path.join(BASE_DIR, "..", "Correções", "Edições", "Rotas Para Editar"),
     ]
     for c in candidatos:
         if c and os.path.isdir(c):
@@ -224,33 +654,39 @@ def dir_rotas() -> Optional[str]:
 
 
 def _norm_txt(texto: Any) -> str:
-    t = normalizar_ascii(str(texto or ""))
-    t = re.sub(r"([A-Z])(\d)", r"\1 \2", t)
-    return re.sub(r"\s+", " ", t).strip()
+    return _normalizar_trecho_agenda(texto)
 
 
 def extrair_codigo_setor(texto: Any) -> Optional[Tuple[str, int]]:
-    """'CARUARU - SCPD 85 - SEG e QUA' -> ('SCPD', 85); 'DOMINGO FEIRA 74' / 'SCFEIRA 74 DOM' -> ('FEIRA', 74)."""
-    m = _RE_CODIGO.search(_norm_txt(texto))
-    if not m:
-        return None
-    pref = m.group(1)
+    """
+    Extrai o par canônico (PREFIXO, NUMERO) para casamento com as rotas planejadas.
+    Ex.: 'CARUARU - SCPD 85 - SEG e QUA' -> ('SCPD', 85);
+         'DOMINGO FEIRA 74' / 'SCFEIRA 74 DOM' -> ('FEIRA', 74);
+         'PESQUEIRA - SC DISTRITO QUINTA 09' -> ('SCDIST', 9).
+    """
+    t = _normalizar_trecho_agenda(texto)
+    pref, num, _, _ = _extrair_bloco_identificacao_e_sufixo(t)
+    if num is None or pref == "OUTRO":
+        m = _RE_CODIGO.search(t)
+        if not m:
+            return None
+        pref = m.group(1)
+        num = int(m.group(2))
     if pref.endswith("FEIRA"):
         pref = "FEIRA"
-    return pref, int(m.group(2))
+    return pref, int(num)
 
 
 def extrair_dias_setor(texto: Any) -> Set[str]:
-    dias: Set[str] = set()
-    for tok in re.findall(r"[A-Z]+", _norm_txt(texto)):
-        tok = DIAS_ALIASES.get(tok, tok)
-        if tok in DIAS_SEMANA:
-            dias.add(tok)
-    return dias
+    """Retorna os dias da semana explicitamente informados no sufixo de agenda do setor."""
+    info = analisar_nomenclatura_setor(texto)
+    if info["tem_sufixo_explicito"]:
+        return set(info["dias_semana"])
+    return set()
 
 
 def listar_rotas_cidade(contrato_id: str) -> List[Dict[str, Any]]:
-    """Indexa os arquivos de rota planejada da cidade: [{apelido, turno, path, codigo, dias, mtime}]."""
+    """Indexa os arquivos de rota planejada da cidade: [{apelido, turno, path, codigo, dias, agenda, mtime}]."""
     raiz = dir_rotas()
     if not raiz:
         return []
@@ -293,7 +729,7 @@ def resolver_rota_setor(
     """
     Resolve o nome do setor retornado pela Inlog para o arquivo de rota planejada.
     Critérios (determinísticos): código do setor (ex: SCPD 85) -> turno -> dias da semana no nome
-    -> dia da semana da data consultada -> rota sem restrição de dia.
+    -> agenda ativa na data consultada -> rota sem restrição de dia.
     Setores operacionais sem rota de coleta (APOIO, OFICINA, DESCARREGO, ENTULHO...) retornam None.
     """
     codigo = extrair_codigo_setor(setor_inlog)
@@ -317,14 +753,12 @@ def resolver_rota_setor(
         if exatos:
             return exatos[0]
     if data_iso:
-        try:
-            wd = datetime.strptime(data_iso, "%Y-%m-%d").weekday()
-            dia_txt = [k for k, v in DIAS_SEMANA.items() if v == wd][0]
-            do_dia = [r for r in cands if dia_txt in r["dias"]]
-            if do_dia:
-                return sorted(do_dia, key=lambda r: len(r["dias"]))[0]
-        except ValueError:
-            pass
+        ativas_dia = [
+            r for r in cands
+            if r["dias"] and setor_visivel_na_data(r["apelido"], data_iso, turno_forcado=r["turno"])
+        ]
+        if ativas_dia:
+            return sorted(ativas_dia, key=lambda r: len(r["dias"]))[0]
     sem_dia = [r for r in cands if not r["dias"]]
     return sem_dia[0] if sem_dia else cands[0]
 

@@ -12,38 +12,75 @@ import io
 import csv
 import json
 import math
+import calendar
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any, Tuple, Optional, Set
 
 import database as db
 import malha_rotas
-from inlog_service import InlogService, formatar_placa_hifen, normalizar_ascii
+from inlog_service import InlogService, formatar_placa_hifen, janela_operacional_cidade, normalizar_ascii
+
+
+NOMENCLATURA_VERSION = "v5_contrato_por_setor"
 
 
 class HeatmapEngine:
+    _cache_nomenclatura_validado = False
+
     def __init__(self, inlog_service: Optional[InlogService] = None):
         self.inlog = inlog_service or InlogService()
+        self._garantir_cache_nomenclatura_atualizado()
+
+    def _garantir_cache_nomenclatura_atualizado(self) -> None:
+        """Invalida uma única vez auditorias em cache geradas antes da regra completa de nomenclatura."""
+        if HeatmapEngine._cache_nomenclatura_validado:
+            return
+        with db._write_lock:
+            if HeatmapEngine._cache_nomenclatura_validado:
+                return
+            conn = db.get_connection()
+            try:
+                with conn:
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS engine_meta (chave TEXT PRIMARY KEY, valor TEXT)"
+                    )
+                    row = conn.execute(
+                        "SELECT valor FROM engine_meta WHERE chave = 'nomenclatura_version'"
+                    ).fetchone()
+                    if not row or row["valor"] != NOMENCLATURA_VERSION:
+                        conn.execute("DELETE FROM auditoria_detalhes")
+                        conn.execute("DELETE FROM auditorias")
+                        conn.execute(
+                            "INSERT OR REPLACE INTO engine_meta (chave, valor) VALUES ('nomenclatura_version', ?)",
+                            (NOMENCLATURA_VERSION,),
+                        )
+                HeatmapEngine._cache_nomenclatura_validado = True
+            except Exception as e:
+                print(f"[ENGINE] Aviso ao validar versão de nomenclatura: {e}")
+            finally:
+                conn.close()
 
     def _ler_regras_operacionais(self) -> Dict[str, float]:
         """Lê parâmetros operacionais configurados no .env."""
-        buffer_m = max(20.0, float(os.getenv("GPS_BUFFER_METROS", "25.0")))
+        buffer_m = max(25.0, float(os.getenv("GPS_BUFFER_METROS", "25.0")))
         vel_min = float(os.getenv("VELOCIDADE_MIN_COLETA", "2.0"))
         vel_max = float(os.getenv("VELOCIDADE_MAX_COLETA", "25.0"))
+        vel_passagem_max = max(float(os.getenv("VELOCIDADE_MAX_PASSAGEM", "110.0")), 110.0)
         dwell_s = float(os.getenv("DWELL_TIME_MIN_SEGUNDOS", "180.0"))
         return {
             "buffer_m": buffer_m,
             "vel_min": vel_min,
             "vel_max": vel_max,
-            "vel_passagem_max": max(vel_max, 38.0),
+            "vel_passagem_max": vel_passagem_max,
             "dwell_s": dwell_s,
         }
 
     def _coletar_frota_e_gps_cidade(
         self, contrato_id: str, data_iso: str, operacao: str = "COLETA", force_refresh: bool = False
     ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, List[Dict[str, Any]]]]:
-        """Descobre as placas do contrato/operação e busca seus pontos GPS reais em paralelo."""
+        """Descobre as placas do contrato/operação e busca seus pontos GPS na janela operacional da cidade."""
         veiculos_rt = self.inlog.get_veiculos_tempo_real(
             contrato_id=contrato_id, operacao=operacao, force_refresh=force_refresh
         )
@@ -75,6 +112,31 @@ class HeatmapEngine:
         except Exception as e:
             print(f"[ENGINE] Aviso ao consultar RD para complementar placas: {e}")
 
+        # Complementa com placas atribuídas aos setores da cidade em Setores/TempoReal
+        try:
+            st_items = self.inlog.get_setores_tempo_real(
+                contrato_id=contrato_id, force_refresh=force_refresh
+            )
+            for item in st_items:
+                macro_setor = normalizar_ascii(f"{item.get('macroSetor', '')} {item.get('setor', '')}")
+                if op_norm in ("", "ALL", "TODAS"):
+                    incluir = True
+                elif op_norm == "COLETA":
+                    incluir = (
+                        "DOMICILIAR" in macro_setor
+                        or "SELETIVA" in macro_setor
+                        or "30 DIAS" in macro_setor
+                        or ("ENTULHO" not in macro_setor and "CAPINA" not in macro_setor and "ROCO" not in macro_setor)
+                    )
+                else:
+                    incluir = op_norm in macro_setor
+                if incluir:
+                    pl = formatar_placa_hifen(item.get("placaVeiculo") or item.get("identificadorVeiculo"))
+                    if pl:
+                        placas_set.add(pl)
+        except Exception as e:
+            print(f"[ENGINE] Aviso ao consultar Setores/TempoReal para complementar placas: {e}")
+
         placas = sorted(placas_set)
         gps_por_placa: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -82,7 +144,13 @@ class HeatmapEngine:
             workers = min(5, len(placas))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futuros = {
-                    pool.submit(self.inlog.get_historico_gps, placa, data_iso, force_refresh): placa
+                    pool.submit(
+                        self.inlog.get_historico_gps_janela_operacional,
+                        placa,
+                        data_iso,
+                        contrato_id,
+                        force_refresh,
+                    ): placa
                     for placa in placas
                 }
                 for fut in as_completed(futuros):
@@ -182,12 +250,12 @@ class HeatmapEngine:
 
                 vel_calc = (dist / dt_s) * 3.6 if dt_s > 0 else max(v1, v2)
 
-                if dist <= 300.0 and dt_s <= 240.0 and vel_calc <= vel_pass_max:
+                if dist <= 500.0 and dt_s <= 240.0 and vel_calc <= vel_pass_max:
                     n_steps = max(1, int(dist // 10.0))
                     for s in range(1, n_steps):
                         frac = s / n_steps
                         add_point(pass_grid, x1 + (x2 - x1) * frac, y1 + (y2 - y1) * frac, placa)
-                elif 300.0 < dist <= 1500.0 and 0 < dt_s <= 900.0:
+                elif 500.0 < dist <= 1800.0 and 0 < dt_s <= 900.0:
                     n_steps = max(2, int(dist // 15.0))
                     for s in range(1, n_steps):
                         frac = s / n_steps
@@ -272,6 +340,14 @@ class HeatmapEngine:
         operacao_norm = (operacao or "COLETA").upper().strip()
         turno_chave = turno if operacao_norm == "COLETA" else f"{turno}:{operacao_norm}"
 
+        if contrato_id in ("all", "todas", "todas_as_cidades"):
+            return self._processar_auditoria_todas_cidades(
+                data_iso=data_iso,
+                turno=turno,
+                forcar_reprocessamento=forcar_reprocessamento,
+                operacao=operacao_norm,
+            )
+
         conn = db.get_connection()
         cur = conn.cursor()
 
@@ -294,11 +370,9 @@ class HeatmapEngine:
         )
         todos_segmentos = cur.fetchall()
 
-        # Regra padrão de frequência por dia da semana para todas as cidades:
-        # Segunda, Quarta e Sexta: só exibe os setores PAR (3ª letra 'P', ex: SCPD, SCPN).
-        # Terça, Quinta e Sábado: só exibe os setores ÍMPAR (3ª letra 'I', ex: SCID, SCIN).
-        # Domingo: só exibe coletas especiais de domingo (DOM, FEIRA).
+        # Filtra segmentos pela agenda oficial da nomenclatura de cada setor na data consultada
         segmentos = []
+        setores_visibilidade_cache: Dict[str, bool] = {}
         for seg in todos_segmentos:
             setor_primario = seg["setor"]
             try:
@@ -308,14 +382,27 @@ class HeatmapEngine:
             except Exception:
                 setores_seg = [setor_primario]
 
-            if any(malha_rotas.setor_visivel_na_data(s, data_iso) for s in setores_seg):
+            visivel = False
+            for s in setores_seg:
+                s_str = str(s or "")
+                if s_str not in setores_visibilidade_cache:
+                    setores_visibilidade_cache[s_str] = malha_rotas.setor_visivel_na_data(
+                        s_str, data_iso, contrato_id=contrato_id
+                    )
+                if setores_visibilidade_cache[s_str]:
+                    visivel = True
+                    break
+            if visivel:
                 segmentos.append(seg)
 
         if not segmentos and todos_segmentos:
-            segmentos = todos_segmentos
+            if all(str(s["setor"] or "S/S").upper() == "S/S" for s in todos_segmentos):
+                segmentos = todos_segmentos
 
-        # 3. Se já existe auditoria em cache no SQLite (e há malha local e não pediu force), retorna rápido
-        if segmentos and not forcar_reprocessamento:
+        # 3. Se já existe auditoria em cache no SQLite (e foi gerada após o fechamento da janela ou sem atualização pendente), retorna rápido
+        win_op = janela_operacional_cidade(contrato_id, data_iso)
+        agora_local_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        if todos_segmentos and not forcar_reprocessamento:
             cur.execute(
                 """
                 SELECT * FROM auditorias
@@ -325,9 +412,16 @@ class HeatmapEngine:
             )
             audit_existente = cur.fetchone()
             if audit_existente:
-                res = self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
-                conn.close()
-                return res
+                criado_em_str = str(audit_existente["criado_em"] or "")
+                cache_obsoleto = (
+                    len(criado_em_str) < 19
+                    or "T" not in criado_em_str
+                    or (criado_em_str < win_op["data_fim"] and agora_local_str > criado_em_str)
+                )
+                if not cache_obsoleto:
+                    res = self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
+                    conn.close()
+                    return res
 
         # 4. Coleta frota real e pontos GPS reais da Inlog em paralelo
         veiculos_rt, placas, gps_por_placa = self._coletar_frota_e_gps_cidade(
@@ -337,7 +431,7 @@ class HeatmapEngine:
         placas_com_gps = {p: len(pts) for p, pts in gps_por_placa.items() if len(pts) > 0}
 
         # Caso a cidade não possua malha viária cadastrada no SQLite, retorna visão completa da Inlog sem erro
-        if not segmentos:
+        if not todos_segmentos:
             conn.close()
             return self._montar_resposta_sem_malha(
                 contrato_id=contrato_id,
@@ -498,8 +592,8 @@ class HeatmapEngine:
                     """
                     INSERT INTO auditorias (
                         contrato_id, data_iso, turno, pct_cobertura, km_total, km_coletado,
-                        km_omissao, total_vias, vias_omissao, placas_ativas_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        km_omissao, total_vias, vias_omissao, placas_ativas_json, criado_em
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         contrato_id,
@@ -512,6 +606,7 @@ class HeatmapEngine:
                         len(segmentos),
                         vias_omissao,
                         json.dumps(placas),
+                        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
                     ),
                 )
                 audit_id = cur.lastrowid
@@ -555,30 +650,42 @@ class HeatmapEngine:
     ) -> Dict[str, Any]:
         """Monta resposta completa para cidades que ainda não têm malha viária GeoJSON importada."""
         setores_inlog = self.inlog.get_cadastro_setores(contrato_id=contrato_id)
-        # Filtra setores conforme a frequência do dia (Regra Par / Ímpar)
+        # Filtra setores conforme nomenclatura/sufixo e prefixo oficial na data
         setores_inlog_filtrados = [
             s for s in setores_inlog
-            if malha_rotas.setor_visivel_na_data(s.get("apelido") or s.get("descricao") or s.get("identificador"), data_iso)
+            if malha_rotas.setor_visivel_na_data(
+                s.get("descricao") or s.get("apelido") or s.get("identificador"),
+                data_iso,
+                contrato_id=contrato_id,
+            )
         ]
         if not setores_inlog_filtrados and setores_inlog:
             setores_inlog_filtrados = setores_inlog
 
-        setores_lista = [
-            {
-                "codigo": s.get("apelido") or s.get("descricao") or s.get("identificador"),
-                "descricao": s.get("descricao"),
-                "identificador": s.get("identificador"),
-                "macroSetor": s.get("macroSetor"),
-                "centro": [0.0, 0.0],
-                "extensao_km": 0.0,
-                "km_coletado": 0.0,
-                "pct_cobertura": 0.0,
-                "vias_omissao": 0,
-                "total_vias": 0,
-                "veiculos": [],
-            }
-            for s in setores_inlog_filtrados
-        ]
+        setores_lista = []
+        for s in setores_inlog_filtrados:
+            cod = s.get("apelido") or s.get("descricao") or s.get("identificador")
+            nom = malha_rotas.analisar_nomenclatura_setor(
+                s.get("descricao") or cod, contrato_id=contrato_id
+            )
+            setores_lista.append(
+                {
+                    "codigo": cod,
+                    "descricao": s.get("descricao"),
+                    "identificador": s.get("identificador"),
+                    "macroSetor": s.get("macroSetor"),
+                    "turno": nom["turno"],
+                    "agenda_rotulo": nom["agenda_rotulo"],
+                    "regra_tipo": nom["regra_tipo"],
+                    "centro": [0.0, 0.0],
+                    "extensao_km": 0.0,
+                    "km_coletado": 0.0,
+                    "pct_cobertura": 0.0,
+                    "vias_omissao": 0,
+                    "total_vias": 0,
+                    "veiculos": [],
+                }
+            )
         data_formatada = datetime.strptime(data_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
         return {
             "resumo": {
@@ -645,7 +752,7 @@ class HeatmapEngine:
             "collected": "#00ff00",
             "not_collected": "#ff0000",
             "possible_gps_gap": "#ffff00",
-            "possible_manual": "#ff9900",
+            "possible_manual": "#0284c7",
         }
 
         features = []
@@ -659,6 +766,23 @@ class HeatmapEngine:
         vias_omissao_ativa = 0
         vias_manuais_ativas = 0
         data_iso_audit = audit_row["data_iso"]
+        contrato_audit = audit_row["contrato_id"]
+        visivel_cache: Dict[str, bool] = {}
+        nom_cache: Dict[str, Dict[str, Any]] = {}
+
+        def _get_nom(s_nome: str) -> Dict[str, Any]:
+            if s_nome not in nom_cache:
+                nom_cache[s_nome] = malha_rotas.analisar_nomenclatura_setor(
+                    s_nome, contrato_id=contrato_audit
+                )
+            return nom_cache[s_nome]
+
+        def _is_visivel(s_nome: str) -> bool:
+            if s_nome not in visivel_cache:
+                visivel_cache[s_nome] = malha_rotas.setor_visivel_na_data(
+                    s_nome, data_iso_audit, contrato_id=contrato_audit
+                )
+            return visivel_cache[s_nome]
 
         for r in rows:
             placas_list = json.loads(r["placas_responsaveis"]) if r["placas_responsaveis"] else []
@@ -671,15 +795,14 @@ class HeatmapEngine:
             except Exception:
                 setores_seg = [setor_primario]
 
-            # Regra padrão para todas as cidades:
-            # Segunda, Quarta e Sexta só exibe setores PAR (3ª letra 'P').
-            # Terça, Quinta e Sábado só exibe setores ÍMPAR (3ª letra 'I').
-            setores_ativos_dia = [s for s in setores_seg if malha_rotas.setor_visivel_na_data(s, data_iso_audit)]
+            setores_ativos_dia = [s for s in setores_seg if _is_visivel(str(s or ""))]
             if not setores_ativos_dia:
                 # Via não opera na data informada
                 continue
 
             setor_exibicao = setores_ativos_dia[0]
+            nom_exib = _get_nom(str(setor_exibicao))
+            turnos_via = sorted(set(_get_nom(str(s))["turno"] for s in setores_ativos_dia))
             ext = float(r["extensao_m"] or 0.0)
             st = r["status"]
             detalhes_por_seg[r["id"]] = (r, st, set(placas_list))
@@ -734,6 +857,8 @@ class HeatmapEngine:
                         "bairro": r["bairro"] or "",
                         "sector": setor_exibicao,
                         "sectors": setores_ativos_dia,
+                        "turnos": turnos_via,
+                        "agenda_rotulo": nom_exib["agenda_rotulo"],
                         "tipo": r["tipo"] or "COLETA",
                         "is_manual": bool(r["is_manual"]),
                         "is_priority": bool(r["is_priority"]),
@@ -753,10 +878,14 @@ class HeatmapEngine:
             total_m = s_info["extensao_m"]
             col_m = s_info["coletado_m"]
             pct = round((col_m / total_m * 100), 2) if total_m > 0 else 0.0
+            info_nom = _get_nom(str(s_cod))
 
             setores_lista.append(
                 {
                     "codigo": s_cod,
+                    "turno": info_nom["turno"],
+                    "agenda_rotulo": info_nom["agenda_rotulo"],
+                    "regra_tipo": info_nom["regra_tipo"],
                     "centro": [round(c_lat, 6), round(c_lon, 6)],
                     "extensao_km": round(total_m / 1000.0, 2),
                     "km_coletado": round(col_m / 1000.0, 2),
@@ -770,7 +899,8 @@ class HeatmapEngine:
         placas_ativas = json.loads(audit_row.get("placas_ativas_json") or "[]")
         data_formatada = datetime.strptime(audit_row["data_iso"], "%Y-%m-%d").strftime("%d/%m/%Y")
 
-        # Conta pontos GPS já cacheados no banco para esta frota/data (rastreabilidade mesmo em leitura de cache)
+        # Conta pontos GPS cacheados na janela operacional da cidade (rastreabilidade mesmo em leitura de cache)
+        win_op_res = janela_operacional_cidade(audit_row["contrato_id"], audit_row["data_iso"])
         total_pontos_gps = 0
         placas_com_gps: Dict[str, int] = {}
         if placas_ativas:
@@ -779,10 +909,10 @@ class HeatmapEngine:
                 f"""
                 SELECT placa, COUNT(*) AS qtd
                 FROM inlog_historico_gps
-                WHERE data_iso = ? AND placa IN ({placeholders})
+                WHERE data_hora >= ? AND substr(data_hora, 1, 19) <= ? AND placa IN ({placeholders})
                 GROUP BY placa
                 """,
-                [audit_row["data_iso"]] + placas_ativas,
+                [win_op_res["data_inicio"], win_op_res["data_fim"][:19]] + placas_ativas,
             )
             for row_gps in cur.fetchall():
                 placas_com_gps[row_gps["placa"]] = row_gps["qtd"]
@@ -802,6 +932,14 @@ class HeatmapEngine:
             "data_iso": audit_row["data_iso"],
             "data_formatada": data_formatada,
             "turno": audit_row["turno"],
+            "janela_operacional": {
+                "inicial": win_op_res["hora_inicial"],
+                "final": win_op_res["hora_final"],
+                "data_inicio": win_op_res["data_inicio"],
+                "data_fim": win_op_res["data_fim"],
+                "diurno": f"{win_op_res['hora_inicial']} → 17:00",
+                "noturno": f"17:00 → {win_op_res['hora_final']} (+1d)",
+            },
             "pct_cobertura": pct_cobertura_ativo,
             "km_total": km_total_ativo,
             "km_coletado": km_coletado_ativo,
@@ -844,6 +982,156 @@ class HeatmapEngine:
             "geojson": {
                 "type": "FeatureCollection",
                 "features": features,
+            },
+        }
+
+    def _processar_auditoria_todas_cidades(
+        self,
+        data_iso: str,
+        turno: str = "DIURNO",
+        forcar_reprocessamento: bool = False,
+        operacao: str = "COLETA",
+    ) -> Dict[str, Any]:
+        """Consolida as auditorias de todas as cidades cadastradas no sistema."""
+        conn = db.get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, nome, centro_lat, centro_lon, zoom_padrao FROM contratos ORDER BY nome")
+        contratos = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+        todas_features = []
+        todos_setores = []
+        setor_codes_seen = set()
+        total_km = 0.0
+        total_coletado_km = 0.0
+        total_omissao_km = 0.0
+        total_manual_km = 0.0
+        total_vias_manuais = 0
+        total_vias_omissao = 0
+        placas_ativas_set = set()
+        total_pontos_gps = 0
+        placas_com_gps: Dict[str, int] = {}
+        resumos_cidades = []
+        pve_km_planejado = 0.0
+        pve_km_executado = 0.0
+        pve_veiculos = []
+        pve_setores = []
+
+        for c in contratos:
+            c_id = c["id"]
+            try:
+                audit = self.processar_ou_obter_auditoria(
+                    c_id, data_iso, turno=turno, forcar_reprocessamento=forcar_reprocessamento, operacao=operacao
+                )
+                r = audit.get("resumo", {})
+                km_tot = float(r.get("km_total", 0.0) or 0.0)
+                km_col = float(r.get("km_coletado", 0.0) or 0.0)
+                km_omis = float(r.get("km_omissao", 0.0) or 0.0)
+                km_man = float(r.get("km_manual", 0.0) or 0.0)
+                v_man = int(r.get("vias_manual", 0) or 0)
+                v_omis = int(r.get("vias_omissao", 0) or 0)
+
+                total_km += km_tot
+                total_coletado_km += km_col
+                total_omissao_km += km_omis
+                total_manual_km += km_man
+                total_vias_manuais += v_man
+                total_vias_omissao += v_omis
+
+                for p in r.get("placas_ativas", []):
+                    placas_ativas_set.add(p)
+
+                total_pontos_gps += int(r.get("total_pontos_gps", 0) or 0)
+                for p, qtd in r.get("placas_com_gps", {}).items():
+                    placas_com_gps[p] = placas_com_gps.get(p, 0) + qtd
+
+                for feat in audit.get("geojson", {}).get("features", []):
+                    props = feat.get("properties", {})
+                    props["cidade_id"] = c_id
+                    props["cidade_nome"] = c["nome"]
+                    todas_features.append(feat)
+
+                for s in audit.get("setores", []):
+                    s_cod = s.get("codigo", "")
+                    s_key = f"{c_id}:{s_cod}"
+                    if s_key not in setor_codes_seen:
+                        setor_codes_seen.add(s_key)
+                        s_copy = dict(s)
+                        s_copy["cidade_id"] = c_id
+                        s_copy["cidade_nome"] = c["nome"]
+                        todos_setores.append(s_copy)
+
+                pve = audit.get("planejado_vs_executado")
+                if isinstance(pve, list):
+                    for pv in pve:
+                        pv_copy = dict(pv)
+                        pv_copy["cidade"] = c["nome"]
+                        pve_veiculos.append(pv_copy)
+                        pve_km_planejado += float(pv.get("km_planejado", 0.0) or 0.0)
+                        pve_km_executado += float(pv.get("km_executado_planejado", 0.0) or 0.0)
+                elif isinstance(pve, dict):
+                    pve_km_planejado += float(pve.get("km_planejado", 0.0) or 0.0)
+                    pve_km_executado += float(pve.get("km_executado", 0.0) or 0.0)
+                    for pv in pve.get("veiculos", []):
+                        pv_copy = dict(pv)
+                        pv_copy["cidade"] = c["nome"]
+                        pve_veiculos.append(pv_copy)
+
+                resumos_cidades.append({
+                    "id": c_id,
+                    "nome": c["nome"],
+                    "pct_cobertura": r.get("pct_cobertura", 0.0),
+                    "km_total": km_tot,
+                    "km_coletado": km_col,
+                    "km_omissao": km_omis,
+                    "km_manual": km_man,
+                    "total_vias": len(audit.get("geojson", {}).get("features", [])),
+                    "placas_ativas": len(r.get("placas_ativas", [])),
+                })
+            except Exception as e:
+                print(f"[ENGINE] Aviso ao consolidar cidade {c_id}: {e}")
+
+        pct_cobertura = round((total_coletado_km / total_km * 100.0), 2) if total_km > 0 else 0.0
+        pct_manual = round((total_manual_km / total_km * 100.0), 2) if total_km > 0 else 0.0
+        try:
+            dt_fmt = datetime.strptime(data_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except Exception:
+            dt_fmt = data_iso
+
+        aderencia_geral = round((pve_km_executado / pve_km_planejado * 100.0), 2) if pve_km_planejado > 0 else 0.0
+
+        return {
+            "resumo": {
+                "id": 0,
+                "contrato_id": "all",
+                "contrato_nome": "Todas as Cidades (Visão Geral)",
+                "data_iso": data_iso,
+                "data_formatada": dt_fmt,
+                "turno": turno,
+                "pct_cobertura": pct_cobertura,
+                "km_total": round(total_km, 2),
+                "km_coletado": round(total_coletado_km, 2),
+                "km_omissao": round(total_omissao_km, 2),
+                "km_manual": round(total_manual_km, 2),
+                "vias_manual": total_vias_manuais,
+                "pct_manual": pct_manual,
+                "total_vias": len(todas_features),
+                "vias_omissao": total_vias_omissao,
+                "placas_ativas": sorted(list(placas_ativas_set)),
+                "placas_com_gps": placas_com_gps,
+                "total_pontos_gps": total_pontos_gps,
+                "centro": [-14.2350, -51.9253],
+                "zoom": 4,
+                "status_inlog": "ONLINE (INLOG OFICIAL)" if self.inlog.is_configured() else "CONSOLIDADO NACIONAL",
+                "sem_malha_viaria": False,
+                "resumos_cidades": resumos_cidades,
+                "frequencia_dia": malha_rotas.info_frequencia_data(data_iso),
+            },
+            "setores": todos_setores,
+            "planejado_vs_executado": pve_veiculos,
+            "geojson": {
+                "type": "FeatureCollection",
+                "features": todas_features,
             },
         }
 
@@ -1063,7 +1351,7 @@ class HeatmapEngine:
 
         cur.execute(
             """
-            SELECT s.nome_rua, s.setor, s.extensao_m
+            SELECT s.nome_rua, s.setor, s.setores_json, s.extensao_m
             FROM segmentos_viarios s
             JOIN auditoria_detalhes d ON d.segmento_id = s.id
             WHERE d.auditoria_id = ? AND d.status = 'not_collected'
@@ -1078,13 +1366,34 @@ class HeatmapEngine:
         writer = csv.writer(output, delimiter=";")
         writer.writerow(["Data", "Cidade", "Setor", "Logradouro / Rua", "Extensão (Metros)", "Situação", "Ação Recomendada"])
 
-        data_fmt = datetime.strptime(audit["data_iso"], "%Y-%m-%d").strftime("%d/%m/%Y")
+        data_iso_aud = audit["data_iso"]
+        contrato_aud = audit["contrato_id"]
+        vis_cache: Dict[str, bool] = {}
+        data_fmt = datetime.strptime(data_iso_aud, "%Y-%m-%d").strftime("%d/%m/%Y")
         for r in linhas:
+            setor_primario = r["setor"] or "S/S"
+            try:
+                setores_seg = json.loads(r["setores_json"]) if r["setores_json"] else [setor_primario]
+                if not isinstance(setores_seg, list) or not setores_seg:
+                    setores_seg = [setor_primario]
+            except Exception:
+                setores_seg = [setor_primario]
+            ativos = []
+            for s_nome in setores_seg:
+                s_str = str(s_nome or "")
+                if s_str not in vis_cache:
+                    vis_cache[s_str] = malha_rotas.setor_visivel_na_data(
+                        s_str, data_iso_aud, contrato_id=contrato_aud
+                    )
+                if vis_cache[s_str]:
+                    ativos.append(s_str)
+            if not ativos:
+                continue
             writer.writerow(
                 [
                     data_fmt,
                     audit["cidade_nome"],
-                    r["setor"],
+                    ativos[0],
                     r["nome_rua"],
                     round(r["extensao_m"], 1),
                     "NÃO COLETADA (ÁREA VERMELHA)",
@@ -1094,3 +1403,411 @@ class HeatmapEngine:
 
         nome_arquivo = f"omissoes_{audit['contrato_id']}_{audit['data_iso']}.csv"
         return output.getvalue(), nome_arquivo
+
+    @staticmethod
+    def _cor_por_percentual(pct: float, eh_manual: bool = False) -> str:
+        """Retorna a cor da legenda por faixa percentual (normal ou manual em tons de azul)."""
+        if eh_manual:
+            if pct >= 80.0:
+                return "#00FFFF"
+            if pct >= 60.0:
+                return "#00BFFF"
+            if pct >= 40.0:
+                return "#0080FF"
+            if pct >= 20.0:
+                return "#0040FF"
+            return "#001F66"
+        if pct >= 80.0:
+            return "#00E600"
+        if pct >= 60.0:
+            return "#FFFF00"
+        if pct >= 40.0:
+            return "#FF9900"
+        if pct >= 20.0:
+            return "#FF0000"
+        return "#660000"
+
+    def processar_auditoria_periodo(
+        self,
+        contrato_id: str,
+        data_iso: str,
+        periodo: str = "mensal",
+        turno: str = "TODOS",
+        operacao: str = "COLETA",
+    ) -> Dict[str, Any]:
+        """Consolida cobertura por rua e setor em janela quinzenal (1ª/2ª) ou mensal."""
+        contrato_id = str(contrato_id or "cabo").lower().strip()
+        periodo_norm = str(periodo or "mensal").lower().strip()
+        if periodo_norm not in ("quinzena1", "quinzena2", "mensal"):
+            return self.processar_ou_obter_auditoria(
+                contrato_id, data_iso, turno=turno, forcar_reprocessamento=False, operacao=operacao
+            )
+
+        dt_ref = datetime.strptime(str(data_iso)[:10], "%Y-%m-%d")
+        ano, mes = dt_ref.year, dt_ref.month
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        if periodo_norm == "quinzena1":
+            dia_ini, dia_fim = 1, 15
+            rotulo_periodo = "1ª Quinzena"
+        elif periodo_norm == "quinzena2":
+            dia_ini, dia_fim = 16, ultimo_dia
+            rotulo_periodo = "2ª Quinzena"
+        else:
+            dia_ini, dia_fim = 1, ultimo_dia
+            rotulo_periodo = "Mensal"
+
+        inicio_iso = f"{ano:04d}-{mes:02d}-{dia_ini:02d}"
+        fim_teorico_iso = f"{ano:04d}-{mes:02d}-{dia_fim:02d}"
+        hoje_iso = datetime.now().strftime("%Y-%m-%d")
+        fim_iso = min(fim_teorico_iso, hoje_iso)
+
+        dias: List[str] = []
+        if inicio_iso <= fim_iso:
+            cur_dt = datetime.strptime(inicio_iso, "%Y-%m-%d")
+            end_dt = datetime.strptime(fim_iso, "%Y-%m-%d")
+            while cur_dt <= end_dt:
+                dias.append(cur_dt.strftime("%Y-%m-%d"))
+                cur_dt += timedelta(days=1)
+
+        operacao_norm = (operacao or "COLETA").upper().strip()
+        turno_chave = "TODOS" if operacao_norm == "COLETA" else f"TODOS:{operacao_norm}"
+        cache_key = f"{contrato_id}:{periodo_norm}:{inicio_iso}:{fim_iso}:{operacao_norm}:{NOMENCLATURA_VERSION}"
+
+        # 0. Cache consolidado de período no SQLite (evita reprocessar 15-30 dias a cada acesso)
+        conn_c = db.get_connection()
+        try:
+            conn_c.execute(
+                "CREATE TABLE IF NOT EXISTS auditorias_periodo_cache (chave TEXT PRIMARY KEY, criado_em TEXT, payload_json TEXT)"
+            )
+            row_c = conn_c.execute(
+                "SELECT criado_em, payload_json FROM auditorias_periodo_cache WHERE chave = ?",
+                (cache_key,),
+            ).fetchone()
+            if row_c and row_c["payload_json"]:
+                cache_valido = fim_iso < hoje_iso
+                if not cache_valido and row_c["criado_em"]:
+                    try:
+                        dt_c = datetime.strptime(row_c["criado_em"], "%Y-%m-%d %H:%M:%S")
+                        if (datetime.now() - dt_c).total_seconds() < 300:
+                            cache_valido = True
+                    except Exception:
+                        pass
+                if cache_valido:
+                    return json.loads(row_c["payload_json"])
+        except Exception:
+            pass
+        finally:
+            conn_c.close()
+
+        db.importar_malha_cidade_se_necessario(contrato_id)
+        conn = db.get_connection()
+        cur = conn.cursor()
+        c_row = cur.execute("SELECT * FROM contratos WHERE id = ?", (contrato_id,)).fetchone()
+        segs_rows = cur.execute(
+            """
+            SELECT id, fid, nome_rua, setor, setores_json, bairro, edge_key,
+                   tipo, is_manual, is_priority, extensao_m, geom_json
+            FROM segmentos_viarios
+            WHERE contrato_id = ?
+            """,
+            (contrato_id,),
+        ).fetchall()
+
+        # Verifica quais dias já estão auditados no SQLite para evitar GeoJSON completo e paralelizar apenas faltantes
+        aud_por_dia: Dict[str, Any] = {}
+        if dias:
+            placeholders = ",".join(["?"] * len(dias))
+            rows_aud = cur.execute(
+                f"SELECT id, data_iso, placas_ativas_json FROM auditorias WHERE contrato_id = ? AND turno = ? AND data_iso IN ({placeholders})",
+                [contrato_id, turno_chave] + dias,
+            ).fetchall()
+            for ra in rows_aud:
+                if ra["data_iso"] != hoje_iso:
+                    aud_por_dia[ra["data_iso"]] = ra
+        conn.close()
+
+        dias_faltantes = [d for d in dias if d not in aud_por_dia]
+        if dias_faltantes:
+            workers = min(4, len(dias_faltantes))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(
+                        self.processar_ou_obter_auditoria,
+                        contrato_id,
+                        d_iso,
+                        "TODOS",
+                        False,
+                        operacao_norm,
+                    ): d_iso
+                    for d_iso in dias_faltantes
+                }
+                for fut in as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"[ENGINE] Aviso ao processar dia {futs[fut]} no período: {e}")
+
+            conn2 = db.get_connection()
+            try:
+                placeholders = ",".join(["?"] * len(dias))
+                rows_aud2 = conn2.execute(
+                    f"SELECT id, data_iso, placas_ativas_json FROM auditorias WHERE contrato_id = ? AND turno = ? AND data_iso IN ({placeholders})",
+                    [contrato_id, turno_chave] + dias,
+                ).fetchall()
+                for ra in rows_aud2:
+                    aud_por_dia[ra["data_iso"]] = ra
+            finally:
+                conn2.close()
+
+        seg_map: Dict[int, Dict[str, Any]] = {}
+        for r in segs_rows:
+            setor_prim = r["setor"] or "S/S"
+            try:
+                setores_seg = json.loads(r["setores_json"]) if r["setores_json"] else [setor_prim]
+                if not isinstance(setores_seg, list) or not setores_seg:
+                    setores_seg = [setor_prim]
+            except Exception:
+                setores_seg = [setor_prim]
+            seg_map[r["id"]] = {
+                "row": r,
+                "setor_primario": setor_prim,
+                "setores_seg": [str(s or "") for s in setores_seg],
+                "dias_previstos": 0,
+                "dias_coletados": 0,
+                "dias_manuais": 0,
+                "placas": set(),
+                "setores_ativos": set(),
+                "turnos": set(),
+            }
+
+        placas_ativas_periodo: Set[str] = set()
+        total_pontos_gps_periodo = 0
+        setores_acc: Dict[str, Dict[str, Any]] = {}
+        vis_cache: Dict[Tuple[str, str], bool] = {}
+        nom_cache: Dict[str, Dict[str, Any]] = {}
+
+        def _eh_visivel(s_nome: str, d_iso: str) -> bool:
+            key = (s_nome, d_iso)
+            if key not in vis_cache:
+                vis_cache[key] = malha_rotas.setor_visivel_na_data(
+                    s_nome, d_iso, contrato_id=contrato_id
+                )
+            return vis_cache[key]
+
+        def _get_nom(s_nome: str) -> Dict[str, Any]:
+            if s_nome not in nom_cache:
+                nom_cache[s_nome] = malha_rotas.analisar_nomenclatura_setor(
+                    s_nome, contrato_id=contrato_id
+                )
+            return nom_cache[s_nome]
+
+        conn_det = db.get_connection()
+        try:
+            for d_iso in dias:
+                ra = aud_por_dia.get(d_iso)
+                status_por_seg: Dict[int, Tuple[str, List[str]]] = {}
+                if ra:
+                    try:
+                        for pl in json.loads(ra["placas_ativas_json"] or "[]"):
+                            placas_ativas_periodo.add(pl)
+                    except Exception:
+                        pass
+                    det_rows = conn_det.execute(
+                        "SELECT segmento_id, status, placas_responsaveis FROM auditoria_detalhes WHERE auditoria_id = ?",
+                        (ra["id"],),
+                    ).fetchall()
+                    for dr in det_rows:
+                        try:
+                            veics = json.loads(dr["placas_responsaveis"] or "[]")
+                        except Exception:
+                            veics = []
+                        status_por_seg[int(dr["segmento_id"])] = (
+                            str(dr["status"] or "not_collected"),
+                            veics,
+                        )
+
+                for sid, info in seg_map.items():
+                    ativos_dia = [s for s in info["setores_seg"] if _eh_visivel(s, d_iso)]
+                    if not ativos_dia:
+                        continue
+                    info["dias_previstos"] += 1
+                    for s_at in ativos_dia:
+                        info["setores_ativos"].add(s_at)
+                        info["turnos"].add(_get_nom(s_at)["turno"])
+
+                    st_dia, veics_dia = status_por_seg.get(sid, ("not_collected", []))
+                    for v in veics_dia:
+                        info["placas"].add(v)
+                    eh_man_dia = (st_dia == "possible_manual") or (
+                        bool(info["row"]["is_manual"]) and st_dia != "not_collected"
+                    )
+                    coletado_dia = st_dia in ("collected", "possible_manual")
+                    if coletado_dia:
+                        info["dias_coletados"] += 1
+                    if eh_man_dia:
+                        info["dias_manuais"] += 1
+
+                    ext_m = float(info["row"]["extensao_m"] or 0.0)
+                    for s_at in ativos_dia:
+                        if s_at not in setores_acc:
+                            nom = _get_nom(s_at)
+                            setores_acc[s_at] = {
+                                "codigo": s_at,
+                                "turno": nom["turno"],
+                                "agenda_rotulo": nom.get("agenda_rotulo", ""),
+                                "regra_tipo": nom["regra_tipo"],
+                                "ext_prev_m": 0.0,
+                                "ext_col_m": 0.0,
+                                "seg_ids": set(),
+                                "seg_baixos": set(),
+                                "veiculos": set(),
+                            }
+                        sa = setores_acc[s_at]
+                        sa["ext_prev_m"] += ext_m
+                        if coletado_dia:
+                            sa["ext_col_m"] += ext_m
+                        sa["seg_ids"].add(sid)
+                        for v in veics_dia:
+                            sa["veiculos"].add(v)
+        finally:
+            conn_det.close()
+
+        features: List[Dict[str, Any]] = []
+        total_m_prev_sum = 0.0
+        coletado_m_sum = 0.0
+        manual_m_sum = 0.0
+        omissao_m_sum = 0.0
+        vias_abaixo_80 = 0
+        vias_manuais = 0
+
+        for sid, info in seg_map.items():
+            if info["dias_previstos"] <= 0:
+                continue
+            r = info["row"]
+            ext_m = float(r["extensao_m"] or 0.0)
+            dias_prev = info["dias_previstos"]
+            dias_col = info["dias_coletados"]
+            dias_man = info["dias_manuais"]
+
+            pct_seg = round((dias_col / dias_prev) * 100.0, 2)
+            eh_manual = bool(r["is_manual"]) or (dias_man > 0)
+            cor = self._cor_por_percentual(pct_seg, eh_manual=eh_manual)
+
+            total_m_prev_sum += ext_m * dias_prev
+            coletado_m_sum += ext_m * dias_col
+            if eh_manual:
+                manual_m_sum += ext_m * dias_col
+                vias_manuais += 1
+            else:
+                omissao_m_sum += ext_m * (dias_prev - dias_col)
+
+            if pct_seg < 80.0:
+                vias_abaixo_80 += 1
+                for s_at in info["setores_ativos"]:
+                    if s_at in setores_acc:
+                        setores_acc[s_at]["seg_baixos"].add(sid)
+
+            status_sint = "possible_manual" if eh_manual else ("collected" if pct_seg >= 80.0 else "not_collected")
+            setores_list = sorted(info["setores_ativos"]) or info["setores_seg"]
+
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": json.loads(r["geom_json"])},
+                    "properties": {
+                        "id": sid,
+                        "fid": r["fid"],
+                        "street_name": r["nome_rua"],
+                        "sector": setores_list[0],
+                        "sectors": setores_list,
+                        "turnos": sorted(info["turnos"]) or [_get_nom(setores_list[0])["turno"]],
+                        "bairro": r["bairro"] or "",
+                        "tipo": r["tipo"] or "COLETA",
+                        "is_manual": eh_manual,
+                        "is_priority": bool(r["is_priority"]),
+                        "status": status_sint,
+                        "pct_periodo": pct_seg,
+                        "dias_previstos": dias_prev,
+                        "dias_coletados": dias_col,
+                        "dias_manuais": dias_man,
+                        "color": cor,
+                        "len_m": round(ext_m, 2),
+                        "vehicles": sorted(info["placas"]),
+                    },
+                }
+            )
+
+        pct_total = round((coletado_m_sum / total_m_prev_sum * 100.0), 2) if total_m_prev_sum > 0 else 0.0
+        pct_manual = round((manual_m_sum / total_m_prev_sum * 100.0), 2) if total_m_prev_sum > 0 else 0.0
+
+        setores_out = []
+        for s_cod in sorted(setores_acc.keys()):
+            sa = setores_acc[s_cod]
+            pct_s = round((sa["ext_col_m"] / sa["ext_prev_m"] * 100.0), 2) if sa["ext_prev_m"] > 0 else 0.0
+            setores_out.append(
+                {
+                    "codigo": s_cod,
+                    "turno": sa["turno"],
+                    "agenda_rotulo": sa["agenda_rotulo"],
+                    "regra_tipo": sa["regra_tipo"],
+                    "extensao_km": round(sa["ext_prev_m"] / 1000.0, 2),
+                    "km_coletado": round(sa["ext_col_m"] / 1000.0, 2),
+                    "pct_cobertura": pct_s,
+                    "vias_omissao": len(sa["seg_baixos"]),
+                    "total_vias": len(sa["seg_ids"]),
+                    "veiculos": sorted(sa["veiculos"]),
+                }
+            )
+
+        resultado_periodo = {
+            "resumo": {
+                "id": None,
+                "contrato_id": contrato_id,
+                "contrato_nome": c_row["nome"] if c_row else contrato_id.title(),
+                "data_iso": data_iso,
+                "data_formatada": f"{datetime.strptime(inicio_iso, '%Y-%m-%d').strftime('%d/%m/%Y')} a {datetime.strptime(fim_iso, '%Y-%m-%d').strftime('%d/%m/%Y')}" if dias else inicio_iso,
+                "turno": turno,
+                "periodo": periodo_norm,
+                "periodo_rotulo": rotulo_periodo,
+                "periodo_inicio": inicio_iso,
+                "periodo_fim": fim_iso,
+                "dias_avaliados": len(dias),
+                "pct_cobertura": pct_total,
+                "km_total": round(total_m_prev_sum / 1000.0, 2),
+                "km_coletado": round(coletado_m_sum / 1000.0, 2),
+                "km_omissao": round(omissao_m_sum / 1000.0, 2),
+                "km_manual": round(manual_m_sum / 1000.0, 2),
+                "vias_manual": vias_manuais,
+                "pct_manual": pct_manual,
+                "total_vias": len(features),
+                "vias_omissao": vias_abaixo_80,
+                "placas_ativas": sorted(placas_ativas_periodo),
+                "total_pontos_gps": total_pontos_gps_periodo,
+                "centro": [c_row["centro_lat"], c_row["centro_lon"]] if c_row else [-8.1930, -34.9364],
+                "zoom": c_row["zoom"] if (c_row and "zoom" in c_row.keys() and c_row["zoom"]) else 13.0,
+                "status_inlog": "ONLINE (INLOG OFICIAL)" if self.inlog.is_configured() else "OFFLINE",
+                "sem_malha_viaria": len(segs_rows) == 0,
+                "operacao": operacao,
+            },
+            "setores": setores_out,
+            "planejado_vs_executado": [],
+            "geojson": {"type": "FeatureCollection", "features": features},
+        }
+        try:
+            with db._write_lock:
+                conn_sv = db.get_connection()
+                try:
+                    with conn_sv:
+                        conn_sv.execute(
+                            "INSERT OR REPLACE INTO auditorias_periodo_cache (chave, criado_em, payload_json) VALUES (?, ?, ?)",
+                            (
+                                cache_key,
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                json.dumps(resultado_periodo, ensure_ascii=False),
+                            ),
+                        )
+                finally:
+                    conn_sv.close()
+        except Exception as e:
+            print(f"[ENGINE] Aviso ao salvar cache de período: {e}")
+        return resultado_periodo

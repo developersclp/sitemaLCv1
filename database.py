@@ -380,12 +380,12 @@ def init_db():
             ("canela", "Canela", -29.3644, -50.8119, 13),
             ("jequie", "Jequié", -13.8575, -40.0839, 13),
             ("novo hamburgo", "Novo Hamburgo", -29.6789, -51.1306, 12.5),
-            ("varzea", "Várzea Grande", -15.6467, -56.1325, 12),
         ]
         cur.executemany(
             "INSERT OR IGNORE INTO contratos (id, nome, centro_lat, centro_lon, zoom_padrao) VALUES (?, ?, ?, ?, ?)",
             contratos_iniciais,
         )
+        cur.execute("DELETE FROM contratos WHERE id = 'varzea'")
     conn.close()
 
 

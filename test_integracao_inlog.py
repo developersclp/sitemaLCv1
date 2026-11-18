@@ -23,6 +23,7 @@ if BASE_DIR not in sys.path:
 import database as db
 from inlog_service import InlogService, identificar_contrato, formatar_placa_hifen
 from engine import HeatmapEngine
+import malha_rotas
 import app as locar_app
 
 
@@ -156,17 +157,18 @@ class TestIntegracaoInlog(unittest.TestCase):
         self.assertEqual(res1["resumo"]["status_inlog"], "ONLINE (INLOG OFICIAL)")
         self.assertIn("planejado_vs_executado", res1)
         self.assertIn("frequencia_dia", res1["resumo"])
-        self.assertEqual(res1["resumo"]["frequencia_dia"]["frequencia"], "PAR")
+        freq_esperada = malha_rotas.info_frequencia_data(self.hoje)["frequencia"]
+        self.assertEqual(res1["resumo"]["frequencia_dia"]["frequencia"], freq_esperada)
 
     def test_05_persistencia_gis_sqlite(self):
         criado = db.salvar_ou_atualizar_segmento({
-            "contrato_id": "varzea",
+            "contrato_id": "cabo",
             "nome_rua": "Rua Teste Integração Inlog",
             "setor": "SETOR-TST",
             "tipo": "COLETA",
             "is_manual": False,
             "is_priority": True,
-            "coordinates": [[-56.1325, -15.6467], [-56.1315, -15.6467]],
+            "coordinates": [[-35.0333, -8.2833], [-35.0323, -8.2833]],
         })
         seg_id = criado["id"]
         self.assertGreater(seg_id, 0)
@@ -175,7 +177,7 @@ class TestIntegracaoInlog(unittest.TestCase):
 
         atualizado = db.salvar_ou_atualizar_segmento({
             "id": seg_id,
-            "contrato_id": "varzea",
+            "contrato_id": "cabo",
             "nome_rua": "Rua Teste Atualizada",
             "setor": "SETOR-TST-2",
             "tipo": "MANUAL",
@@ -320,6 +322,204 @@ class TestIntegracaoInlog(unittest.TestCase):
         # CSV da cidade do link continua acessível para o destinatário
         csv_view = sess.get(f"{self.local_url}/api/exportar-csv?id={audit_id}", timeout=15)
         self.assertEqual(csv_view.status_code, 200)
+
+    def test_08_auditoria_todas_as_cidades(self):
+        """Valida a consolidação de todas as cidades e o centro nacional do mapa."""
+        res_all = self.engine.processar_ou_obter_auditoria("all", self.hoje, forcar_reprocessamento=False)
+        self.assertIn("resumo", res_all)
+        self.assertIn("geojson", res_all)
+        self.assertEqual(res_all["resumo"]["contrato_id"], "all")
+        self.assertEqual(res_all["resumo"]["centro"], [-14.2350, -51.9253])
+        self.assertEqual(res_all["resumo"]["zoom"], 4)
+        self.assertGreater(len(res_all["geojson"]["features"]), 10000)
+        self.assertGreater(res_all["resumo"]["km_total"], 0)
+        self.assertIn("resumos_cidades", res_all["resumo"])
+        self.assertGreaterEqual(len(res_all["resumo"]["resumos_cidades"]), 10)
+
+    def test_09_nomenclatura_setores_completa(self):
+        """Valida rigorosamente todas as regras de nomenclatura, sufixos, ordinais, QZ, prefixos e turnos."""
+        # Novembro 2026:
+        # 2026-11-02 (Seg, 1ª seg), 2026-11-03 (Ter, 1ª ter), 2026-11-04 (Qua, 1ª qua),
+        # 2026-11-05 (Qui, 1ª qui), 2026-11-06 (Sex, 1ª sex), 2026-11-07 (Sab, 1º sab), 2026-11-08 (Dom, 2º dom)
+        # 1. Dias individuais
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 25 SEG", "2026-11-02"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCAD 25 SEG", "2026-11-03"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 26 TER", "2026-11-03"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 99 QUA", "2026-11-04"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCPD 99 QUA", "2026-11-02"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDIST 11 QUI", "2026-11-05"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 100 SEX", "2026-11-06"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCFEIRA 12 SAB", "2026-11-07"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDOM 28 DOM", "2026-11-08"))
+
+        # 2. Combinações com espaço e com "E"
+        for d in ("2026-11-02", "2026-11-04", "2026-11-06"):
+            self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 01 SEG QUA SEX", d))
+            self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 01 SEG E QUA E SEX", d))
+            self.assertFalse(malha_rotas.setor_visivel_na_data("SCID 01 TER QUI SAB", d))
+        for d in ("2026-11-03", "2026-11-05", "2026-11-07"):
+            self.assertTrue(malha_rotas.setor_visivel_na_data("SCID 01 TER QUI SAB", d))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDD 04 TER e SAB", "2026-11-03"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDD 04 TER e SAB", "2026-11-07"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDD 04 TER e SAB", "2026-11-04"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 39 QUA e SEX", "2026-11-04"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCSBD 01 TER e QUI", "2026-11-05"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCSCD 05 QUA e SEX", "2026-11-06"))
+
+        # 3. Intervalos com "A"
+        for d in ("2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"):
+            self.assertTrue(malha_rotas.setor_visivel_na_data("SCDN 19 SEG A SEX", d))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDN 19 SEG A SEX", "2026-11-07"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDN 01 SEG A SAB", "2026-11-07"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDN 01 SEG A SAB", "2026-11-08"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDD 01 TER A QUI", "2026-11-04"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDD 01 TER A QUI", "2026-11-06"))
+
+        # 4. Ordinais no mês (1, 2, 3, 4, L)
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCRURAL 1 SAB 1", "2026-11-07"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCRURAL 1 SAB 1", "2026-11-14"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCRURAL 2 SAB 2", "2026-11-14"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCRURAL 2 SAB 2", "2026-11-07"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCRURAL 3 SAB L", "2026-11-28"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCRURAL 3 SAB L", "2026-11-21"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 10 TER 1 3", "2026-11-03"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCAD 10 TER 1 3", "2026-11-10"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 10 TER 1 3", "2026-11-17"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 11 QUA L SAB 3 L", "2026-11-25"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 11 QUA L SAB 3 L", "2026-11-21"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 11 QUA L SAB 3 L", "2026-11-28"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCAD 11 QUA L SAB 3 L", "2026-11-14"))
+
+        # 5. Quinzenal (QZ)
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 20 SEG QZ 06.04.2026", "2026-04-06"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCAD 20 SEG QZ 06.04.2026", "2026-04-13"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 20 SEG QZ 06.04.2026", "2026-04-20"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 21 SAB QZ 04.04.2026", "2026-04-04"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCAD 21 SAB QZ 04.04.2026", "2026-04-11"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCAD 21 SAB QZ 04.04.2026", "2026-04-18"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDIST 12 QUI QZ 07.05.2026", "2026-05-07"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDIST 12 QUI QZ 07.05.2026", "2026-05-14"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDIST 09 QUI QZ 14.05.2026", "2026-05-14"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDIST 09 QUI QZ 14.05.2026", "2026-05-07"))
+
+        # 6. Padrão por prefixo (sem sufixo explícito) + caso DOM BOSCO não confundir DOM
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDD 01", "2026-11-08"))  # SCD* é diário (todos os dias)
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDN 22", "2026-11-08"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCPD 06", "2026-11-02"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCPD 06", "2026-11-03"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCPV 16", "2026-11-04"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCID 04", "2026-11-03"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCID 04", "2026-11-04"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("CUIABA - SCID 54 - REGIAO DO DOM BOSCO", "2026-11-03"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("CUIABA - SCID 54 - REGIAO DO DOM BOSCO", "2026-11-08"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDOM 31", "2026-11-08"))
+        self.assertFalse(malha_rotas.setor_visivel_na_data("SCDOM 31", "2026-11-07"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDOMD 43", "2026-11-08"))
+        self.assertTrue(malha_rotas.setor_visivel_na_data("SCDOMN 46", "2026-11-08"))
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCSBD 01")["regra_tipo"], "SEM_AGENDA_PADRAO")
+
+        # 7. Turnos (DIURNO vs NOTURNO)
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCDOMD 43")["turno"], "DIURNO")
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCDOMN 46")["turno"], "NOTURNO")
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCPV 16")["turno"], "DIURNO")
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCPM 45")["turno"], "NOTURNO")
+        self.assertEqual(malha_rotas.analisar_nomenclatura_setor("SCSBD 01 TER e QUI")["turno"], "DIURNO")
+
+    def test_10_janela_operacional_e_velocidade_cidades(self):
+        """Valida janela operacional por cidade (05:00->05:00 + exceções Cuiabá/Olinda/Paulista) e cobertura real."""
+        from inlog_service import janela_operacional_cidade
+
+        wc = janela_operacional_cidade("cuiaba", "2026-11-16")
+        self.assertEqual(wc["data_inicio"], "2026-11-16T04:00:00")
+        self.assertEqual(wc["data_fim"], "2026-11-17T05:00:00")
+        self.assertEqual(wc["diurno_fim"], "2026-11-16T17:00:00")
+
+        wo = janela_operacional_cidade("olinda", "2026-11-16")
+        self.assertEqual(wo["data_inicio"], "2026-11-16T05:00:00")
+        self.assertEqual(wo["data_fim"], "2026-11-17T07:00:00")
+
+        wp = janela_operacional_cidade("paulista", "2026-11-16")
+        self.assertEqual(wp["data_inicio"], "2026-11-16T05:00:00")
+        self.assertEqual(wp["data_fim"], "2026-11-17T07:00:00")
+
+        wk = janela_operacional_cidade("cabo", "2026-11-16")
+        self.assertEqual(wk["data_inicio"], "2026-11-16T05:00:00")
+        self.assertEqual(wk["data_fim"], "2026-11-17T05:00:00")
+
+        res_cui = self.engine.processar_ou_obter_auditoria("cuiaba", "2026-11-16", forcar_reprocessamento=False)
+        mapa_setores = {s["codigo"]: s["pct_cobertura"] for s in res_cui["setores"]}
+        self.assertGreaterEqual(mapa_setores.get("SCPM 50", 0), 98.0)
+        self.assertGreaterEqual(mapa_setores.get("SCPM 49", 0), 98.0)
+        self.assertGreaterEqual(mapa_setores.get("SCPD 12 SEG", 0), 95.0)
+
+    def test_11_pesqueira_veiculo_regional_e_setores(self):
+        """Valida inclusão de veículos emprestados entre regionais (ex: PCE-7467 de Garanhuns operando Pesqueira)."""
+        res_pesq = self.engine.processar_ou_obter_auditoria(
+            "pesqueira", "2026-11-16", turno="TODOS", forcar_reprocessamento=False
+        )
+        self.assertIn("PCE-7467", res_pesq["resumo"]["placas_ativas"])
+        mapa = {s["codigo"]: s["pct_cobertura"] for s in res_pesq["setores"]}
+        self.assertGreaterEqual(mapa.get("SCDIST 13 SEG", 0), 99.0)
+        self.assertGreaterEqual(mapa.get("SCPD 01", 0), 98.0)
+        self.assertGreaterEqual(mapa.get("SCPD 02", 0), 95.0)
+        self.assertGreaterEqual(mapa.get("SCPN 03", 0), 95.0)
+
+    def test_12_link_periodo_quinzenal_mensal_e_manual_azul(self):
+        """Valida geração de link quinzenal/mensal, trava contra alteração na URL e paleta azul para coleta manual."""
+        from engine import HeatmapEngine
+
+        # 1. Paleta por % (Normal e Manual Azul)
+        self.assertEqual(HeatmapEngine._cor_por_percentual(95.0, False), "#00E600")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(70.0, False), "#FFFF00")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(50.0, False), "#FF9900")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(30.0, False), "#FF0000")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(10.0, False), "#660000")
+
+        self.assertEqual(HeatmapEngine._cor_por_percentual(95.0, True), "#00FFFF")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(70.0, True), "#00BFFF")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(50.0, True), "#0080FF")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(30.0, True), "#0040FF")
+        self.assertEqual(HeatmapEngine._cor_por_percentual(10.0, True), "#001F66")
+
+        # 2. UI possui modalSharePeriodo, legendPeriodo e Coleta Manual em azul (#0284C7)
+        session = requests.Session()
+        session.post(f"{self.local_url}/api/auth/login", json={"password": "filialsaopaulo01"}, timeout=10)
+        html = session.get(f"{self.local_url}/", timeout=15).text
+        for item in ("modalSharePeriodo", "legendPeriodo", "#0284C7"):
+            self.assertIn(item, html)
+
+        # 3. Gera link de 2ª Quinzena travado (quem acessa não consegue forçar periodo=diario na URL)
+        gen = session.post(
+            f"{self.local_url}/api/compartilhar/gerar",
+            json={
+                "cidade": "pesqueira",
+                "data": "2026-11-16",
+                "periodo": "quinzena2",
+                "turno": "all",
+                "coleta": "all",
+                "setores": [],
+            },
+            timeout=10,
+        ).json()
+        self.assertTrue(gen["sucesso"])
+        token = gen["token"]
+
+        sess_view = requests.Session()
+        view_html = sess_view.get(f"{self.local_url}{gen['path']}", timeout=15).text
+        self.assertIn('"periodo": "quinzena2"', view_html)
+
+        aud_view = sess_view.get(
+            f"{self.local_url}/api/auditoria?cidade=cabo&data=2026-11-10&periodo=diario&token={token}",
+            timeout=60,
+        ).json()
+        self.assertEqual(aud_view["resumo"]["contrato_id"], "pesqueira")
+        self.assertEqual(aud_view["resumo"]["periodo"], "quinzena2")
+        self.assertEqual(aud_view["resumo"]["periodo_inicio"], "2026-11-16")
+        self.assertGreaterEqual(aud_view["resumo"]["dias_avaliados"], 1)
+        self.assertGreater(len(aud_view["geojson"]["features"]), 0)
+        f0 = aud_view["geojson"]["features"][0]["properties"]
+        self.assertIn("pct_periodo", f0)
+        self.assertIn("dias_previstos", f0)
 
 
 if __name__ == "__main__":
