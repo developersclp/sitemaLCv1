@@ -10,6 +10,7 @@ Integração completa 100% real com a API Inlog (Inlog.Integration.Coleta.Api):
 """
 
 import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -18,7 +19,7 @@ import secrets
 import threading
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, Optional
@@ -3800,28 +3801,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 
 class LocarRequestHandler(BaseHTTPRequestHandler):
-    def _send_json(self, data: object, status: int = 200, extra_headers: Optional[Dict[str, str]] = None):
+    def _send_bytes(self, raw: bytes, content_type: str, status: int = 200, extra_headers: Optional[Dict[str, str]] = None, cookies_out: Optional[list] = None):
+        accept_enc = self.headers.get("Accept-Encoding", "").lower()
+        usar_gzip = ("gzip" in accept_enc) and len(raw) > 1024
+        body = gzip.compress(raw, compresslevel=4) if usar_gzip else raw
+
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        if usar_gzip:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-
-    def _send_html(self, html_bytes: bytes, status: int = 200, cookies_out: Optional[list] = None):
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
         if cookies_out:
             for ck in cookies_out:
                 self.send_header("Set-Cookie", ck)
         self.end_headers()
-        self.wfile.write(html_bytes)
+        self.wfile.write(body)
+
+    def _send_json(self, data: object, status: int = 200, extra_headers: Optional[Dict[str, str]] = None):
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        headers = {"Access-Control-Allow-Origin": "*"}
+        if extra_headers:
+            headers.update(extra_headers)
+        self._send_bytes(raw, "application/json; charset=utf-8", status=status, extra_headers=headers)
+
+    def _send_html(self, html_bytes: bytes, status: int = 200, cookies_out: Optional[list] = None):
+        self._send_bytes(
+            html_bytes,
+            "text/html; charset=utf-8",
+            status=status,
+            extra_headers={"Pragma": "no-cache", "Expires": "0"},
+            cookies_out=cookies_out,
+        )
 
     def _redirect(self, location: str, cookies_out: Optional[list] = None):
         self.send_response(302)
@@ -4466,21 +4481,26 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
 
 
 def _inicializar_background():
-    """Constrói malhas pendentes e pré-aquece auditorias de ontem/hoje em segundo plano."""
+    """Constrói malhas pendentes e pré-aquece suavemente auditorias de ontem sem travar a CPU."""
+    time.sleep(3)
     try:
         malha_rotas.preconstruir_todas_cidades()
     except Exception as e:
         print(f"[STARTUP] Aviso ao pre-construir malhas: {e}")
 
     if inlog.is_configured():
-        for delta_dias in (1, 0):
-            data_alvo = (datetime.now() - timedelta(days=delta_dias)).strftime("%Y-%m-%d")
+        data_ontem = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        conn = db.get_connection()
+        try:
+            cids = [r["id"] for r in conn.execute("SELECT id FROM contratos ORDER BY nome").fetchall()]
+        finally:
+            conn.close()
+        for cid in cids:
             try:
-                print(f"[STARTUP] Pré-aquecendo auditoria de todas as cidades ({data_alvo})...")
-                engine.processar_ou_obter_auditoria("all", data_alvo, forcar_reprocessamento=False, operacao="COLETA")
-                print(f"[STARTUP] Pré-aquecimento concluído ({data_alvo}).")
+                engine.processar_ou_obter_auditoria(cid, data_ontem, forcar_reprocessamento=False, operacao="COLETA")
+                time.sleep(0.3)
             except Exception as e:
-                print(f"[STARTUP] Aviso no pré-aquecimento ({data_alvo}): {e}")
+                print(f"[STARTUP] Aviso no pré-aquecimento ({cid}/{data_ontem}): {e}")
 
 
 def run(port: int = 8080):

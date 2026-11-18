@@ -1071,7 +1071,7 @@ class HeatmapEngine:
                         pass
 
         audits_por_cid: Dict[str, Any] = {}
-        with ThreadPoolExecutor(max_workers=4) as city_pool:
+        with ThreadPoolExecutor(max_workers=2) as city_pool:
             futuros_cid = {
                 city_pool.submit(
                     self.processar_ou_obter_auditoria,
