@@ -192,6 +192,8 @@ class InlogService:
         self._token_expiry: float = 0.0
         self._token_lock = threading.Lock()
         self._cache_lock = threading.Lock()
+        self._setores_rt_lock = threading.Lock()
+        self._rd_lock = threading.Lock()
         self._mem_cache: Dict[str, Tuple[float, Any]] = {}
         self._recent_fetches: Dict[str, float] = {}
         self._setores_rt_refreshing = False
@@ -601,8 +603,8 @@ class InlogService:
         self, contrato_id: Optional[str] = None, force_refresh: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        Consulta GET /api/Setores/TempoReal (timeout estendido de 60s).
-        Usa snapshot em SQLite como cache inteligente (TTL 120s) e fallback em caso de timeout.
+        Consulta GET /api/Setores/TempoReal (timeout estendido de 90s).
+        Usa single-flight lock + snapshot em SQLite (TTL 300s) e fallback em caso de timeout.
         """
         cid_norm = identificar_contrato(contrato_id) or (contrato_id.lower().strip() if contrato_id else None)
         if cid_norm in ("todas", "all", ""):
@@ -611,28 +613,32 @@ class InlogService:
         if not self.is_configured():
             return []
 
-        usar_cache = False
-        if not force_refresh:
-            conn = db.get_connection()
-            try:
-                row = conn.execute(
-                    "SELECT COUNT(*) AS qtd, MAX(atualizado_em) AS ult FROM inlog_setores_tempo_real"
-                ).fetchone()
-                if row and row["qtd"] > 0 and row["ult"]:
-                    dt_ult = datetime.strptime(row["ult"], "%Y-%m-%d %H:%M:%S")
-                    # Nota: CURRENT_TIMESTAMP no SQLite é UTC
-                    idade_seg = (datetime.now(timezone.utc).replace(tzinfo=None) - dt_ult).total_seconds()
-                    if idade_seg < 180:
-                        usar_cache = True
-            except Exception:
-                pass
-            finally:
-                conn.close()
+        with self._setores_rt_lock:
+            usar_cache = False
+            if self._recent_fetch_valid("setores_rt", 20.0):
+                usar_cache = True
+            elif not force_refresh:
+                conn = db.get_connection()
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) AS qtd, MAX(atualizado_em) AS ult FROM inlog_setores_tempo_real"
+                    ).fetchone()
+                    if row and row["qtd"] > 0 and row["ult"]:
+                        dt_ult = datetime.strptime(row["ult"], "%Y-%m-%d %H:%M:%S")
+                        # Nota: CURRENT_TIMESTAMP no SQLite é UTC
+                        idade_seg = (datetime.now(timezone.utc).replace(tzinfo=None) - dt_ult).total_seconds()
+                        if idade_seg < 300:
+                            usar_cache = True
+                except Exception:
+                    pass
+                finally:
+                    conn.close()
 
-        if not usar_cache:
-            sucesso, dados, _, _ = self._request_get("/api/Setores/TempoReal", timeout=60)
-            if sucesso and isinstance(dados, list):
-                self._persistir_setores_tempo_real(dados)
+            if not usar_cache:
+                sucesso, dados, _, _ = self._request_get("/api/Setores/TempoReal", timeout=90)
+                if sucesso and isinstance(dados, list):
+                    self._persistir_setores_tempo_real(dados)
+                    self._mark_recent_fetch("setores_rt")
 
         return self._ler_setores_tempo_real_db(cid_norm)
 
@@ -739,27 +745,28 @@ class InlogService:
         if data_iso > hoje_str:
             return []
 
-        usar_cache = False
-        fetch_key = f"rd:{data_iso}"
-        if not force_refresh:
-            if data_iso == hoje_str and self._recent_fetch_valid(fetch_key, 20.0):
+        with self._rd_lock:
+            usar_cache = False
+            fetch_key = f"rd:{data_iso}"
+            if self._recent_fetch_valid(fetch_key, 20.0):
                 usar_cache = True
-            elif data_iso < hoje_str:
-                fetch_ate = self._obter_fetch_ate("__RD__", data_iso)
-                if fetch_ate and fetch_ate >= f"{data_iso}T23:59:59":
-                    usar_cache = True
-
-        if not usar_cache:
-            params = {
-                "dataInicio": f"{data_iso}T00:00:00",
-                "dataFim": f"{data_iso}T23:59:59",
-            }
-            sucesso, dados, _, _ = self._request_get("/api/RelatorioDiario", params=params, timeout=30)
-            if sucesso and isinstance(dados, list):
-                self._persistir_relatorios_diarios(data_iso, dados)
-                self._mark_recent_fetch(fetch_key)
+            elif not force_refresh:
                 if data_iso < hoje_str:
-                    self._atualizar_fetch_ate("__RD__", data_iso, f"{data_iso}T23:59:59")
+                    fetch_ate = self._obter_fetch_ate("__RD__", data_iso)
+                    if fetch_ate and fetch_ate >= f"{data_iso}T23:59:59":
+                        usar_cache = True
+
+            if not usar_cache:
+                params = {
+                    "dataInicio": f"{data_iso}T00:00:00",
+                    "dataFim": f"{data_iso}T23:59:59",
+                }
+                sucesso, dados, _, _ = self._request_get("/api/RelatorioDiario", params=params, timeout=60)
+                if sucesso and isinstance(dados, list):
+                    self._persistir_relatorios_diarios(data_iso, dados)
+                    self._mark_recent_fetch(fetch_key)
+                    if data_iso < hoje_str:
+                        self._atualizar_fetch_ate("__RD__", data_iso, f"{data_iso}T23:59:59")
 
         return self._ler_relatorios_diarios_db(data_iso, cid_norm)
 

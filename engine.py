@@ -80,10 +80,42 @@ class HeatmapEngine:
     def _coletar_frota_e_gps_cidade(
         self, contrato_id: str, data_iso: str, operacao: str = "COLETA", force_refresh: bool = False
     ) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, List[Dict[str, Any]]]]:
-        """Descobre as placas do contrato/operação e busca seus pontos GPS na janela operacional da cidade."""
-        veiculos_rt = self.inlog.get_veiculos_tempo_real(
-            contrato_id=contrato_id, operacao=operacao, force_refresh=force_refresh
-        )
+        """Descobre as placas do contrato/operação (em paralelo) e busca seus pontos GPS na janela operacional."""
+        veiculos_rt: List[Dict[str, Any]] = []
+        rd_items: List[Dict[str, Any]] = []
+        st_items: List[Dict[str, Any]] = []
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f_rt = pool.submit(
+                self.inlog.get_veiculos_tempo_real,
+                contrato_id=contrato_id,
+                operacao=operacao,
+                force_refresh=force_refresh,
+            )
+            f_rd = pool.submit(
+                self.inlog.get_relatorio_diario,
+                data_iso,
+                contrato_id=contrato_id,
+                force_refresh=force_refresh,
+            )
+            f_st = pool.submit(
+                self.inlog.get_setores_tempo_real,
+                contrato_id=contrato_id,
+                force_refresh=force_refresh,
+            )
+            try:
+                veiculos_rt = f_rt.result() or []
+            except Exception as e:
+                print(f"[ENGINE] Aviso ao consultar Veiculos/TempoReal: {e}")
+            try:
+                rd_items = f_rd.result() or []
+            except Exception as e:
+                print(f"[ENGINE] Aviso ao consultar RD para complementar placas: {e}")
+            try:
+                st_items = f_st.result() or []
+            except Exception as e:
+                print(f"[ENGINE] Aviso ao consultar Setores/TempoReal para complementar placas: {e}")
+
         placas_set: Set[str] = set()
         for v in veiculos_rt:
             pl = formatar_placa_hifen(v.get("placaVeiculo") or v.get("identificadorVeiculo"))
@@ -92,50 +124,38 @@ class HeatmapEngine:
 
         # Complementa com placas registradas no Relatório Diário daquela cidade/data
         op_norm = normalizar_ascii(operacao)
-        try:
-            rd_items = self.inlog.get_relatorio_diario(
-                data_iso, contrato_id=contrato_id, force_refresh=force_refresh
-            )
-            for item in rd_items:
-                grupo_op = normalizar_ascii(f"{item.get('grupoControle', '')} {item.get('operacao', '')}")
-                if op_norm in ("", "ALL", "TODAS"):
-                    incluir = True
-                elif op_norm == "COLETA":
-                    incluir = ("DOMICILIAR" in grupo_op or "SELETIVA" in grupo_op or "30 DIAS" in grupo_op)
-                else:
-                    incluir = op_norm in grupo_op
+        for item in rd_items:
+            grupo_op = normalizar_ascii(f"{item.get('grupoControle', '')} {item.get('operacao', '')}")
+            if op_norm in ("", "ALL", "TODAS"):
+                incluir = True
+            elif op_norm == "COLETA":
+                incluir = ("DOMICILIAR" in grupo_op or "SELETIVA" in grupo_op or "30 DIAS" in grupo_op)
+            else:
+                incluir = op_norm in grupo_op
 
-                if incluir:
-                    pl = formatar_placa_hifen(item.get("placa") or item.get("veiculo"))
-                    if pl:
-                        placas_set.add(pl)
-        except Exception as e:
-            print(f"[ENGINE] Aviso ao consultar RD para complementar placas: {e}")
+            if incluir:
+                pl = formatar_placa_hifen(item.get("placa") or item.get("veiculo"))
+                if pl:
+                    placas_set.add(pl)
 
         # Complementa com placas atribuídas aos setores da cidade em Setores/TempoReal
-        try:
-            st_items = self.inlog.get_setores_tempo_real(
-                contrato_id=contrato_id, force_refresh=force_refresh
-            )
-            for item in st_items:
-                macro_setor = normalizar_ascii(f"{item.get('macroSetor', '')} {item.get('setor', '')}")
-                if op_norm in ("", "ALL", "TODAS"):
-                    incluir = True
-                elif op_norm == "COLETA":
-                    incluir = (
-                        "DOMICILIAR" in macro_setor
-                        or "SELETIVA" in macro_setor
-                        or "30 DIAS" in macro_setor
-                        or ("ENTULHO" not in macro_setor and "CAPINA" not in macro_setor and "ROCO" not in macro_setor)
-                    )
-                else:
-                    incluir = op_norm in macro_setor
-                if incluir:
-                    pl = formatar_placa_hifen(item.get("placaVeiculo") or item.get("identificadorVeiculo"))
-                    if pl:
-                        placas_set.add(pl)
-        except Exception as e:
-            print(f"[ENGINE] Aviso ao consultar Setores/TempoReal para complementar placas: {e}")
+        for item in st_items:
+            macro_setor = normalizar_ascii(f"{item.get('macroSetor', '')} {item.get('setor', '')}")
+            if op_norm in ("", "ALL", "TODAS"):
+                incluir = True
+            elif op_norm == "COLETA":
+                incluir = (
+                    "DOMICILIAR" in macro_setor
+                    or "SELETIVA" in macro_setor
+                    or "30 DIAS" in macro_setor
+                    or ("ENTULHO" not in macro_setor and "CAPINA" not in macro_setor and "ROCO" not in macro_setor)
+                )
+            else:
+                incluir = op_norm in macro_setor
+            if incluir:
+                pl = formatar_placa_hifen(item.get("placaVeiculo") or item.get("identificadorVeiculo"))
+                if pl:
+                    placas_set.add(pl)
 
         placas = sorted(placas_set)
         gps_por_placa: Dict[str, List[Dict[str, Any]]] = {}
@@ -413,10 +433,31 @@ class HeatmapEngine:
             audit_existente = cur.fetchone()
             if audit_existente:
                 criado_em_str = str(audit_existente["criado_em"] or "")
+                try:
+                    placas_salvas = json.loads(audit_existente["placas_ativas_json"] or "[]")
+                    if not isinstance(placas_salvas, list):
+                        placas_salvas = []
+                except Exception:
+                    placas_salvas = []
+
+                auditoria_vazia = (
+                    float(audit_existente["pct_cobertura"] or 0.0) <= 0.0
+                    and len(placas_salvas) == 0
+                    and data_iso <= datetime.now().strftime("%Y-%m-%d")
+                )
+                idade_cache_seg = 999999.0
+                if len(criado_em_str) >= 19 and "T" in criado_em_str:
+                    try:
+                        dt_c = datetime.strptime(criado_em_str[:19], "%Y-%m-%dT%H:%M:%S")
+                        idade_cache_seg = (datetime.now() - dt_c).total_seconds()
+                    except Exception:
+                        pass
+
                 cache_obsoleto = (
                     len(criado_em_str) < 19
                     or "T" not in criado_em_str
                     or (criado_em_str < win_op["data_fim"] and agora_local_str > criado_em_str)
+                    or (auditoria_vazia and idade_cache_seg >= 60.0)
                 )
                 if not cache_obsoleto:
                     res = self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
@@ -1017,12 +1058,44 @@ class HeatmapEngine:
         pve_veiculos = []
         pve_setores = []
 
+        # Pré-aquece os 3 endpoints globais da Inlog uma única vez em paralelo antes do pool de cidades
+        if forcar_reprocessamento:
+            with ThreadPoolExecutor(max_workers=3) as pre_pool:
+                f1 = pre_pool.submit(self.inlog.get_veiculos_tempo_real, force_refresh=True)
+                f2 = pre_pool.submit(self.inlog.get_relatorio_diario, data_iso, force_refresh=True)
+                f3 = pre_pool.submit(self.inlog.get_setores_tempo_real, force_refresh=True)
+                for f in (f1, f2, f3):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+
+        audits_por_cid: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=4) as city_pool:
+            futuros_cid = {
+                city_pool.submit(
+                    self.processar_ou_obter_auditoria,
+                    c["id"],
+                    data_iso,
+                    turno=turno,
+                    forcar_reprocessamento=forcar_reprocessamento,
+                    operacao=operacao,
+                ): c["id"]
+                for c in contratos
+            }
+            for fut in as_completed(futuros_cid):
+                cid_f = futuros_cid[fut]
+                try:
+                    audits_por_cid[cid_f] = fut.result()
+                except Exception as e:
+                    print(f"[ENGINE] Erro ao auditar cidade {cid_f}: {e}")
+
         for c in contratos:
             c_id = c["id"]
             try:
-                audit = self.processar_ou_obter_auditoria(
-                    c_id, data_iso, turno=turno, forcar_reprocessamento=forcar_reprocessamento, operacao=operacao
-                )
+                audit = audits_por_cid.get(c_id)
+                if audit is None:
+                    continue
                 r = audit.get("resumo", {})
                 km_tot = float(r.get("km_total", 0.0) or 0.0)
                 km_col = float(r.get("km_coletado", 0.0) or 0.0)

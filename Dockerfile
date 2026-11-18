@@ -5,12 +5,14 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
+    TZ=America/Sao_Paulo \
     PORT=8080
 
 WORKDIR /app
 
-# Instala bibliotecas C essenciais para operacoes espaciais/GIS (GDAL, GEOS, PROJ) e compiladores
+# Instala bibliotecas C essenciais para operacoes espaciais/GIS (GDAL, GEOS, PROJ), tzdata e compiladores
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
     build-essential \
     gcc \
     g++ \

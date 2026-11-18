@@ -4465,10 +4465,28 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def _inicializar_background():
+    """Constrói malhas pendentes e pré-aquece auditorias de ontem/hoje em segundo plano."""
+    try:
+        malha_rotas.preconstruir_todas_cidades()
+    except Exception as e:
+        print(f"[STARTUP] Aviso ao pre-construir malhas: {e}")
+
+    if inlog.is_configured():
+        for delta_dias in (1, 0):
+            data_alvo = (datetime.now() - timedelta(days=delta_dias)).strftime("%Y-%m-%d")
+            try:
+                print(f"[STARTUP] Pré-aquecendo auditoria de todas as cidades ({data_alvo})...")
+                engine.processar_ou_obter_auditoria("all", data_alvo, forcar_reprocessamento=False, operacao="COLETA")
+                print(f"[STARTUP] Pré-aquecimento concluído ({data_alvo}).")
+            except Exception as e:
+                print(f"[STARTUP] Aviso no pré-aquecimento ({data_alvo}): {e}")
+
+
 def run(port: int = 8080):
     host = os.getenv("HOST", "0.0.0.0")
     server_address = (host, port)
-    threading.Thread(target=malha_rotas.preconstruir_todas_cidades, daemon=True).start()
+    threading.Thread(target=_inicializar_background, daemon=True).start()
     httpd = ThreadingHTTPServer(server_address, LocarRequestHandler)
     print("=" * 72)
     print(" LOCAR SANEAMENTO AMBIENTAL - SISTEMA LC v1 (INLOG 100% REAL)")
