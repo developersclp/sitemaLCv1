@@ -1,95 +1,103 @@
 # 🚀 Manual Oficial de Deploy no Railway — Sistema LC v1 (Locar & Inlog)
 
-Este guia contém o passo a passo completo para colocar o **Sistema LC v1** no ar pelo **Railway**, com **banco de dados próprio persistente (SQLite + Volume)**, **chaves da API Inlog seguras**, **autenticação do Painel Central** e **Links Exclusivos Assinados (`/v/<token>`)**.
+Este guia contém o passo a passo completo e definitivo para colocar o **Sistema LC v1** no ar pelo **Railway**, com **Docker oficial**, **banco de dados próprio persistente (SQLite + Volume)**, **chaves da API Inlog seguras**, **autenticação do Painel Central** e **Links Exclusivos Assinados (`/v/<token>`)**.
 
 ---
 
-## 1. Arquivos de Deploy Já Preparados no Projeto
+## 1. Por Que o Erro `pip: command not found` Ocorria e Como Foi Resolvido
 
-O sistema já está estruturado com todos os manifestos exigidos pelo Railway (tanto na raiz quanto dentro da pasta `sitemaLCv1`):
+No Nixpacks padrão, ao customizar pacotes nativos para C/GIS (`gcc`, `gdal`, `geos`, `proj`), o pacote `python312` puro do Nixpkgs vinha sem o binário executável do `pip` configurado no ambiente `/bin/bash`, causando a falha imediata no deploy (`exit code 127`).
+
+**A Solução Implementada:**
+1. **`Dockerfile` Oficial Debian (`python:3.12-slim`):** O projeto agora utiliza Docker nativo com `pip`, `gdal-bin`, `libgdal-dev`, `libgeos-dev`, `libproj-dev` e compiladores instalados de forma 100% determinística.
+2. **`railway.json` Otimizado:** Configurado com `"builder": "DOCKERFILE"`, garantindo cache de camadas e build rápido.
+3. **`.dockerignore` Criado:** Bloqueia o upload de arquivos desnecessários (`.git`, `locar.db` local pesado de >600MB, `__pycache__`), tornando o envio e build extremamente leves.
+4. **`nixpacks.toml` Corrigido (Fallback):** Mesmo que o Railway use Nixpacks, agora ele inclui `python312Packages.pip`, `virtualenv` e ativação automática do ambiente.
+
+---
+
+## 2. Arquivos de Configuração no Projeto
 
 | Arquivo | Função no Railway |
 | :--- | :--- |
-| `requirements.txt` | Instala `geopandas`, `pyogrio`, `shapely`, `pandas` e `pyproj`. |
-| `nixpacks.toml` | Configura Python 3.12 e bibliotecas nativas GIS (`gdal`, `geos`, `proj`, `gcc`). |
-| `Procfile` | Define o processo web padrão (`python app.py` / `python sitemaLCv1/app.py`). |
-| `railway.json` | Define builder `NIXPACKS`, política de restart automático e healthcheck `/api/status`. |
-| `.env.example` | Modelo oficial de todas as variáveis de ambiente de produção. |
-| `database.py` | Suporta `DATABASE_PATH` e `RAILWAY_VOLUME_MOUNT_PATH` com cópia automática de seed. |
+| `Dockerfile` | Constrói a imagem Linux Debian com Python 3.12, GDAL, GEOS, PROJ e dependências. |
+| `.dockerignore` | Evita envio de arquivos pesados locais para o container. |
+| `requirements.txt` | Lista as bibliotecas Python (`geopandas`, `pyogrio`, `shapely`, `pandas`, `pyproj`, `requests`, `urllib3`). |
+| `railway.json` | Define builder `DOCKERFILE`, política de restart e healthcheck em `/api/status`. |
+| `nixpacks.toml` | Fallback de contingência caso o builder Nixpacks seja selecionado. |
+| `Procfile` | Declara o processo web (`python app.py`). |
+| `database.py` | Suporta `DATABASE_PATH` e `RAILWAY_VOLUME_MOUNT_PATH` com persistência em `/data`. |
+| `.env.example` | Modelo com todas as variáveis de ambiente necessárias para produção. |
 
 ---
 
-## 2. Subindo o Projeto para o GitHub
+## 3. Passo a Passo do Deploy no Railway
 
-> ⚠️ **Importante sobre o banco `locar.db`:**  
-> O arquivo local `locar.db` costuma ultrapassar **100 MB** (limite padrão de push do GitHub). Por segurança e compatibilidade, `sitemaLCv1/.gitignore` já ignora `.env` e `locar.db*`.  
-> Todas as malhas viárias (`.gpkg`) e rotas planejadas (`.gpkg`) estão abaixo de 65 MB e serão enviadas normalmente para o GitHub — na primeira inicialização no Railway, o sistema reconstrói automaticamente toda a base do banco a partir dos `.gpkg` dentro do Volume persistente.
+### Passo 1: Enviar as Atualizações para o GitHub
 
-1. Crie um repositório **Privado** no GitHub (ex: `locar-sistema-lc`).
-2. Entre na pasta oficial do projeto (`cd sitemaLCv1`) para enviar somente os arquivos de produção (sem arquivos legados da pasta pai), inicialize e envie o código:
-   ```bash
-   cd sitemaLCv1
-   git init
-   git add .
-   git commit -m "Deploy inicial Sistema LC v1 pronto para Railway"
-   git branch -M main
-   git remote add origin https://github.com/SEU_USUARIO/locar-sistema-lc.git
-   git push -u origin main
-   ```
+No terminal do seu projeto:
+
+```bash
+git add .
+git commit -m "Fix deploy: Dockerfile oficial com suporte GIS GDAL/GEOS e railway.json configurado"
+git push origin main
+```
+
+*(Se o seu repositório já estiver conectado ao Railway, um novo build iniciará automaticamente!)*
 
 ---
 
-## 3. Criando o Projeto e Serviço no Railway
+### Passo 2: Conectar o Repositório no Railway (Se for um Novo Projeto)
 
-1. Acesse [railway.app](https://railway.app) e faça login.
-2. Clique em **New Project** -> **Deploy from GitHub repo** e selecione `locar-sistema-lc`.
-3. Se você enviou a pasta inteira `sistemaLC`:
-   - Vá em **Settings** -> **Source** -> **Root Directory** e informe **`sitemaLCv1`** *(recomendado, pois os caminhos de malhas e rotas ficam diretos na raiz do container)*.
-4. Aguarde o build inicial no painel **Deployments** (pode levar ~2 minutos na primeira vez por causa dos pacotes geoespaciais).
+1. Acesse [railway.app](https://railway.app) e faça login com seu GitHub.
+2. Clique em **+ New Project** -> **Deploy from GitHub repo**.
+3. Selecione o repositório `sitemaLCv1` (ou o repositório onde seu código está hospedado).
+4. O Railway detectará automaticamente o `Dockerfile` e `railway.json`.
 
 ---
 
-## 4. Configurando o Banco de Dados Próprio (Volume Persistente)
+### Passo 3: Configurar o Volume Persistente para o Banco SQLite
 
-Sem um **Volume**, o sistema perderia as edições feitas no QGIS Web e o cache de auditorias/GPS a cada novo deploy.
+Para garantir que o banco de dados `locar.db` (com edições de malha e históricos) não seja reiniciado a cada novo deploy:
 
-1. No serviço criado no Railway, clique com o botão direito na tela de arquitetura (ou aperte `Ctrl + K` -> **Add Volume**) e adicione um **Volume** ao serviço.
-2. Em **Mount Path**, configure exatamente:
+1. No painel do seu serviço no Railway, clique em **+ New** (ou no menu do canvas) -> **Volume** (ou aperte `Ctrl + K` -> digite `Volume`).
+2. Conecte o Volume ao seu serviço.
+3. Em **Mount Path**, digite exatamente:
    ```
    /data
    ```
-3. Como definido em `database.py`, o banco passará a gravar em `/data/locar.db` (e se um dia você subir seu `locar.db` via Railway CLI/SFTP para `/data/locar.db`, ele será preservado entre todos os deploys).
+4. Clique em **Save**. O banco agora ficará salvo permanentemente em `/data/locar.db`.
 
-> 💡 **Dica de Recursos:**  
-> Como o cruzamento espacial carrega malhas `.gpkg` completas em RAM, recomenda-se manter o serviço no plano **Hobby** ou **Pro** com pelo menos **2 GB a 4 GB de RAM**.
+> 💡 **Dica de Recursos:**
+> Para processamento geográfico com malhas viárias e rotas completas em memória, recomenda-se configurar o plano com pelo menos **2 GB a 4 GB de RAM** (aba **Settings** -> **Deploy** -> **Resource Limits**).
 
 ---
 
-## 5. Configurando as Variáveis de Ambiente e Chaves (Variables)
+### Passo 4: Configurar as Variáveis de Ambiente (Aba Variables)
 
-Na aba **Variables** do seu serviço no Railway, adicione as variáveis abaixo (use **Raw Editor** para colar tudo de uma vez e preencher suas senhas):
+No painel do serviço no Railway, clique na aba **Variables** -> selecione **Raw Editor** e cole as variáveis abaixo (substituindo pelos seus dados reais):
 
 ```env
 # API OFICIAL INLOG
 INLOG_BASE_URL=https://locar.inlog.com.br/IntegrationColeta
 INLOG_TOKEN_URL=https://locar.inlog.com.br/autenticacao-services/connect/token
 INLOG_CLIENT_ID=Locar.Client.Api.Coleta
-INLOG_CLIENT_SECRET=COLOQUE_AQUI_SEU_CLIENT_SECRET_OFICIAL_INLOG
+INLOG_CLIENT_SECRET=COLE_AQUI_SEU_CLIENT_SECRET_INLOG
 INLOG_SERVER_ID=Inlog.Integration.Coleta.Api
 
-# SEGURANÇA DO PAINEL E DOS LINKS ASSINADOS
-SECRET_KEY=COLOQUE_UM_SEGREDO_FORTE_ALEATORIO_COM_32_OU_MAIS_CARACTERES
-ADMIN_PASSWORD=DEFINA_A_SENHA_DE_ACESSO_DO_SEU_SETOR
+# SEGURANÇA DO PAINEL E LINKS ASSINADOS
+SECRET_KEY=CRIE_UMA_CHAVE_SECRETA_LONGA_E_ALEATORIA_COM_32_CHARS
+ADMIN_PASSWORD=SUA_SENHA_DE_ACESSO_AO_PAINEL_CENTRAL
 REQUIRE_ADMIN_LOGIN=true
 
-# BANCO DE DADOS NO VOLUME PERSISTENTE
+# PERSISTÊNCIA NO VOLUME
 DATABASE_PATH=/data/locar.db
 
-# CONFIGURAÇÃO DO SERVIDOR E MALHAS
+# SERVIDOR E MALHAS
 HOST=0.0.0.0
 MALHA_TIPO=TRANSITAVEIS
 
-# REGRAS DE AUDITORIA ESPACIAL
+# AUDITORIA ESPACIAL
 GPS_BUFFER_METROS=20.0
 VELOCIDADE_MIN_COLETA=2.0
 VELOCIDADE_MAX_COLETA=25.0
@@ -97,47 +105,29 @@ DWELL_TIME_MIN_SEGUNDOS=180
 ```
 
 > ⚠️ **Atenção:**
-> - **Não** defina `PORT` manualmente no Railway — o próprio Railway injeta `PORT` automaticamente e o `app.py` lê `os.getenv("PORT", 8080)`.
-> - Defina `REQUIRE_ADMIN_LOGIN=true` em produção para garantir que a URL principal (`https://seu-dominio.up.railway.app/`) sempre peça a senha do seu setor (`ADMIN_PASSWORD`).
-> - Copie o valor real de `INLOG_CLIENT_SECRET` do seu arquivo local `sitemaLCv1/.env` (não incluído no Git).
+> - **Não** crie a variável `PORT` manualmente. O Railway injeta `PORT` automaticamente e a aplicação escuta na porta correta (`os.getenv("PORT", 8080)`).
+> - Certifique-se de preencher `INLOG_CLIENT_SECRET` com o segredo oficial da sua empresa.
 
 ---
 
-## 6. Gerando Domínio Público e Testando
+### Passo 5: Gerar o Domínio Público
 
-1. Vá em **Settings** -> **Networking** -> **Public Networking** -> clique em **Generate Domain** (ou conecte um domínio próprio da Locar, ex: `monitoramento.locar.com.br`).
-2. Acesse `https://seu-dominio.up.railway.app/api/status`:
-   - Deve retornar JSON com `"inlog_configurado": true` e `"status_inlog": "ONLINE"`.
-3. Acesse `https://seu-dominio.up.railway.app/`:
-   - Com `REQUIRE_ADMIN_LOGIN=true`, aparecerá a tela **Painel Central Operacional Locar** pedindo sua `ADMIN_PASSWORD`.
-   - Ao entrar, você terá acesso completo a todas as cidades, Edição GIS, Central Inlog e geração de links.
+1. No serviço, vá na aba **Settings** -> role até **Networking** -> **Public Networking**.
+2. Clique no botão **Generate Domain**.
+3. O Railway criará uma URL HTTPS pública (exemplo: `https://sistemalcv1-production.up.railway.app`).
 
 ---
 
-## 7. Como Funciona a Segurança dos Links Compartilhados (`/v/<token>`)
+### Passo 6: Validação do Sistema no Ar
 
-Quando você clica em **🔗 Link** no painel:
-
-1. O servidor gera uma URL assinada criptograficamente com HMAC-SHA256 no formato:
-   ```
-   https://seu-dominio.up.railway.app/v/eyJjaWRhZGUiOi...
-   ```
-2. **O que o destinatário vê ao abrir o link:**
-   - Apenas a **Logo LOCAR**, o nome do projeto/cidade/data no topo e o botão **⬇ Baixar CSV**.
-   - **Sem** barra superior, **sem** Edição GIS, **sem** Central Inlog, **sem** troca de cidades e **sem** Camadas Inlog em Tempo Real.
-   - Mantém os **4 cards de métricas** (incluindo `% de Coleta Manual`), a legenda com **Coleta Manual** no mapa e os filtros **Por coleta**, **Turno (Diurno / Noturno)**, **Por setor** e **Carros**.
-3. **Blindagem contra adulteração de URL:**
-   - Se quem recebeu o link tentar mudar o token na URL, o servidor bloqueia com **403 Link Inválido**.
-   - Se tentar apagar o `/v/...` da URL para acessar a raiz `/` e ver o Painel Central, o navegador possui trava `HttpOnly` (`lc_viewer_lock`) e o servidor **bloqueia e redireciona imediatamente para `/login`**, exigindo `ADMIN_PASSWORD`.
-   - Tentativas diretas às APIs de escrita, logs ou troca de cidade são recusadas no backend com **HTTP 403**.
-
----
-
-## 8. Verificando Logs e Saúde no Railway
-
-- No painel do serviço -> aba **Deploy Logs** e **HTTP Logs**, você acompanhará:
-  - `[DB] Banco inicial copiado para volume persistente: /data/locar.db` (caso exista seed)
-  - `[MALHA] <cidade>: projeto construído com X trechos...`
-  - `Servidor multi-thread ativo em: http://0.0.0.0:<PORT>`
-  - `Banco SQLite ativo: /data/locar.db`
-- **Backup do Banco:** Você pode usar o botão **📥 Exportar GeoJSON** dentro do modo **Edição GIS** para exportar suas edições de malha sempre que desejar, ou realizar snapshot direto do Volume no menu **Volumes -> Backups** do Railway.
+1. **Checagem de Saúde do Servidor:**
+   Acesse no navegador:
+   `https://seu-dominio.up.railway.app/api/status`
+   - Deve responder com HTTP 200 e JSON indicando `"inlog_configurado": true`.
+2. **Acesso ao Painel Central:**
+   Acesse a URL raiz:
+   `https://seu-dominio.up.railway.app/`
+   - O sistema solicitará sua `ADMIN_PASSWORD`.
+   - Ao logar, todas as cidades cadastradas, camadas em tempo real e rotas estarão operacionais.
+3. **Links Compartilhados de Visualização:**
+   - Ao gerar um link `/v/<token>`, ele estará ativo para clientes sem exigir login, isolado com permissão somente-leitura.

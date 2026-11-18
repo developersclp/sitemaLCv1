@@ -1,0 +1,12 @@
+.git
+.github
+.env
+*.env.local
+locar.db
+locar.db-wal
+locar.db-shm
+__pycache__/
+*.pyc
+*.pyo
+scratch/
+test_integracao_inlog.py

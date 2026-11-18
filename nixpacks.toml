@@ -1,8 +1,12 @@
 [phases.setup]
-nixPkgs = ["python312", "gcc", "gdal", "geos", "proj"]
+nixPkgs = ["python312", "python312Packages.pip", "python312Packages.virtualenv", "gcc", "gdal", "geos", "proj"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
+cmds = [
+    "python3 -m venv /opt/venv",
+    ". /opt/venv/bin/activate && pip install --no-cache-dir --upgrade pip",
+    ". /opt/venv/bin/activate && pip install --no-cache-dir -r requirements.txt"
+]
 
 [start]
-cmd = "python app.py"
+cmd = "/opt/venv/bin/python app.py"
