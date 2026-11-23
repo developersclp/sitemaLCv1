@@ -743,17 +743,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
             background-color: var(--locar-green-dark);
             border: 2px solid #FFFFFF;
             box-shadow: 0 1px 4px rgba(0,0,0,0.3);
-            opacity: 0.45;
+            opacity: 1;
             transition: all 0.2s ease;
         }
         .sector-pill-label {
             position: absolute; bottom: 14px; left: 50%;
-            transform: translateX(-50%) scale(0.85);
+            transform: translateX(-50%) scale(1);
             background: rgba(15, 23, 42, 0.92);
             color: #FFFFFF; font-size: 11px; font-weight: 700; letter-spacing: 0.4px;
             padding: 3px 9px; border-radius: 9999px; white-space: nowrap;
             box-shadow: 0 4px 12px rgba(0,0,0,0.25);
-            opacity: 0; pointer-events: none; transition: all 0.2s;
+            opacity: 1; pointer-events: none; transition: all 0.2s;
             border: 1px solid rgba(255,255,255,0.15);
         }
         .sector-badge-container:hover .sector-dot-marker { opacity: 1; transform: scale(1.3); background-color: var(--locar-green); }
