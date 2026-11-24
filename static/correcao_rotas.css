@@ -1,0 +1,664 @@
+/* ==========================================================================
+   MÓDULO INTEGRADO: CORREÇÃO DE ROTAS (ABA LATERAL + PAINEL ADMIN DE ANÁLISE)
+   ========================================================================== */
+
+:root {
+    --cr-verde: #038242;
+    --cr-verde-esc: #006331;
+    --cr-oliva: #C3CD85;
+    --cr-fundo: #f4f6f3;
+    --cr-borda: #dfe5dc;
+    --cr-texto: #1d2b22;
+    --cr-suave: #5d6b62;
+    --cr-perigo: #c0392b;
+    --cr-c-manual: #1f6fd1;
+    --cr-c-trajeto: #e67e22;
+    --cr-c-mover: #8e44ad;
+    --cr-c-temp: #4a5a6a;
+    --cr-c-normal: #27ae60;
+    --cr-c-add: #e6007e;
+}
+
+/* Botões no Cabeçalho Principal e no Link Compartilhado */
+.btn-correcao-rotas {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: linear-gradient(135deg, #038242 0%, #006331 100%);
+    color: #FFFFFF;
+    border: 1px solid #A7F3D0;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+.btn-correcao-rotas:hover {
+    background: linear-gradient(135deg, #049a4e 0%, #03753b 100%);
+    transform: translateY(-1px);
+}
+.btn-correcao-rotas.ativo {
+    background: #FEF3C7;
+    color: #92400E;
+    border-color: #F59E0B;
+}
+
+.btn-admin-solicitacoes {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255, 255, 255, 0.14);
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 6px;
+    padding: 6px 11px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    position: relative;
+    white-space: nowrap;
+}
+.btn-admin-solicitacoes:hover {
+    background: rgba(255, 255, 255, 0.24);
+}
+.sol-badge-count {
+    background: #EF4444;
+    color: #FFFFFF;
+    font-size: 0.68rem;
+    font-weight: 800;
+    padding: 1px 6px;
+    border-radius: 999px;
+    line-height: 1.3;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+}
+
+/* No Link Compartilhado: exibe botão de Correção de Rotas e oculta o botão Admin */
+body.modo-link-compartilhado #btnAdminSolicitacoes {
+    display: none !important;
+}
+body.modo-link-compartilhado #btnAbrirCorrecaoRotas {
+    display: inline-flex !important;
+}
+
+/* Layout quando a Aba Lateral de Correção está aberta */
+.main-container {
+    display: flex;
+    position: relative;
+}
+
+#crPainelLateral {
+    width: 390px;
+    min-width: 390px;
+    max-width: 100vw;
+    height: 100%;
+    background: #FFFFFF;
+    border-right: 1px solid var(--cr-borda);
+    display: none;
+    flex-direction: column;
+    z-index: 1050;
+    box-shadow: 4px 0 18px rgba(0, 0, 0, 0.08);
+    order: -1;
+}
+body.cr-ativo #crPainelLateral {
+    display: flex;
+}
+body.cr-ativo #sidebarRight {
+    display: none !important;
+}
+body.cr-ativo #btnPrintMapaCidade,
+body.cr-ativo #allCitiesBottomLegend {
+    display: none !important;
+}
+
+.cr-painel-topo {
+    padding: 11px 14px;
+    background: linear-gradient(135deg, #038242 0%, #006331 100%);
+    color: #FFFFFF;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 3px solid var(--cr-oliva);
+}
+.cr-painel-topo-titulo {
+    font-size: 0.92rem;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+}
+.cr-painel-topo-sub {
+    font-size: 0.72rem;
+    opacity: 0.9;
+    margin-top: 2px;
+}
+.cr-btn-fechar-aba {
+    background: rgba(255, 255, 255, 0.18);
+    color: #FFFFFF;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 0.74rem;
+    font-weight: 700;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.cr-btn-fechar-aba:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+.cr-painel-corpo {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 14px 36px;
+    color: var(--cr-texto);
+}
+
+.cr-painel-corpo h3 {
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--cr-verde-esc);
+    margin: 16px 0 8px;
+    font-weight: 800;
+}
+.cr-painel-corpo h3:first-child {
+    margin-top: 2px;
+}
+
+.cr-bloco {
+    border: 1px solid var(--cr-borda);
+    border-radius: 10px;
+    padding: 11px 12px;
+    margin-bottom: 11px;
+    background: #FFFFFF;
+}
+.cr-rot {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--cr-suave);
+    margin: 9px 0 4px;
+}
+.cr-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.cr-chip {
+    border: 1px solid var(--cr-borda);
+    background: #FFFFFF;
+    border-radius: 999px;
+    padding: 5px 11px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    color: var(--cr-texto);
+}
+.cr-chip.ativo {
+    background: var(--cr-verde);
+    border-color: var(--cr-verde);
+    color: #FFFFFF;
+}
+
+#crListaSetores {
+    max-height: 210px;
+    overflow-y: auto;
+    border: 1px solid var(--cr-borda);
+    border-radius: 8px;
+    margin-top: 5px;
+}
+.cr-setor-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid #eef1ed;
+    cursor: pointer;
+    font-size: 12.5px;
+}
+.cr-setor-item:last-child {
+    border-bottom: none;
+}
+.cr-setor-item:hover {
+    background: #f3f8f4;
+}
+.cr-setor-item.ativo {
+    background: #e4f3e9;
+    font-weight: 700;
+}
+.cr-setor-item .bol {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    flex: none;
+}
+.cr-setor-item .nome {
+    flex: 1;
+}
+.cr-setor-item .ag {
+    color: var(--cr-suave);
+    font-size: 11px;
+    font-weight: 400;
+}
+.cr-setor-item .qt {
+    font-size: 11px;
+    background: var(--cr-c-add);
+    color: #FFFFFF;
+    border-radius: 999px;
+    padding: 1px 7px;
+    font-weight: 700;
+}
+
+.cr-modos {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
+}
+.cr-modo {
+    border: 2px solid var(--cr-borda);
+    background: #FFFFFF;
+    border-radius: 10px;
+    padding: 8px 4px;
+    cursor: pointer;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1.25;
+    text-align: center;
+    color: var(--cr-texto);
+}
+.cr-modo .ic {
+    font-size: 19px;
+    display: block;
+    margin-bottom: 2px;
+}
+.cr-modo.ativo {
+    border-color: var(--cr-verde);
+    background: #eef7f1;
+    color: var(--cr-verde-esc);
+}
+
+.cr-dica {
+    font-size: 12px;
+    color: var(--cr-suave);
+    line-height: 1.45;
+    margin-top: 8px;
+}
+
+.cr-input, .cr-select, .cr-textarea {
+    width: 100%;
+    border: 1px solid #cdd6cf;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #FFFFFF;
+    color: var(--cr-texto);
+}
+.cr-textarea {
+    resize: vertical;
+    min-height: 58px;
+}
+
+#crSelecao .resumo {
+    font-size: 13.5px;
+    margin-bottom: 6px;
+}
+#crSelecao .ruas {
+    font-size: 12px;
+    color: var(--cr-suave);
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
+.cr-acoes {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+}
+.cr-acao {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border: 1px solid var(--cr-borda);
+    border-left: 6px solid #999;
+    border-radius: 8px;
+    background: #FFFFFF;
+    padding: 8px 10px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 700;
+    text-align: left;
+    color: var(--cr-texto);
+}
+.cr-acao small {
+    display: block;
+    font-weight: 400;
+    color: var(--cr-suave);
+    font-size: 11.5px;
+    margin-top: 1px;
+}
+.cr-acao:hover {
+    background: #f6faf7;
+}
+
+.cr-pedido {
+    border: 1px solid var(--cr-borda);
+    border-left: 6px solid #999;
+    border-radius: 8px;
+    padding: 9px 10px;
+    margin-bottom: 8px;
+    font-size: 12.5px;
+    background: #FFFFFF;
+}
+.cr-pedido .t {
+    font-weight: 700;
+}
+.cr-pedido .m {
+    color: var(--cr-suave);
+    font-size: 12px;
+    margin: 3px 0;
+}
+.cr-pedido .bt {
+    display: flex;
+    gap: 12px;
+    margin-top: 5px;
+}
+.cr-grupo-setor {
+    font-weight: 700;
+    font-size: 12.5px;
+    margin: 10px 0 6px;
+    color: var(--cr-verde-esc);
+}
+
+.cr-btn {
+    border: none;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13.5px;
+    font-weight: 700;
+    cursor: pointer;
+    background: var(--cr-verde);
+    color: #FFFFFF;
+    transition: background 0.15s;
+}
+.cr-btn:hover {
+    background: var(--cr-verde-esc);
+}
+.cr-btn:disabled {
+    background: #b9c4bc;
+    cursor: not-allowed;
+}
+.cr-btn-sec {
+    border: 1px solid var(--cr-borda);
+    background: #FFFFFF;
+    color: var(--cr-texto);
+    border-radius: 8px;
+    padding: 8px 11px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 12.5px;
+}
+.cr-btn-sec:hover {
+    border-color: var(--cr-verde);
+    color: var(--cr-verde-esc);
+}
+.cr-btn-link {
+    background: none;
+    border: none;
+    color: var(--cr-verde-esc);
+    cursor: pointer;
+    font-weight: 600;
+    padding: 0;
+    font-size: 12px;
+    text-decoration: underline;
+}
+.cr-contador {
+    background: var(--cr-c-add);
+    color: #FFFFFF;
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-size: 11.5px;
+    margin-left: 5px;
+}
+.cr-vazio {
+    font-size: 12.5px;
+    color: var(--cr-suave);
+    text-align: center;
+    padding: 10px;
+}
+.cr-alerta {
+    background: #fff7e0;
+    border: 1px solid #f1d58a;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    margin-bottom: 8px;
+}
+.cr-alerta.info {
+    background: #eef5ff;
+    border-color: #bcd3f5;
+}
+.cr-linha {
+    display: flex;
+    gap: 8px;
+}
+.cr-linha > * {
+    flex: 1;
+}
+
+/* Legenda e Aviso Flutuantes sobre o Mapa no Modo Correção */
+#crLegendaMapa {
+    position: absolute;
+    right: 14px;
+    bottom: 18px;
+    z-index: 900;
+    background: rgba(255, 255, 255, 0.96);
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.16);
+    padding: 10px 12px;
+    font-size: 11.5px;
+    max-width: 245px;
+    display: none;
+    border: 1px solid var(--cr-borda);
+}
+body.cr-ativo #crLegendaMapa {
+    display: block;
+}
+#crLegendaMapa .li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 3px 0;
+}
+#crLegendaMapa .lc {
+    width: 24px;
+    height: 5px;
+    border-radius: 3px;
+    flex: none;
+}
+#crLegendaMapa .lt {
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: var(--cr-texto);
+}
+
+#crAvisoMapa {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 950;
+    background: #1d2b22;
+    color: #FFFFFF;
+    border-radius: 999px;
+    padding: 7px 16px;
+    font-size: 12.5px;
+    font-weight: 600;
+    display: none;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.25);
+    pointer-events: none;
+}
+
+.leaflet-tooltip.cr-dica-seg {
+    background: #1d2b22;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 5px 8px;
+}
+.leaflet-tooltip.cr-dica-seg:before {
+    display: none;
+}
+
+.cr-popup-setores button {
+    display: block;
+    width: 100%;
+    margin: 4px 0;
+    border: 1px solid #cdd6cf;
+    background: #FFFFFF;
+    border-radius: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    font-weight: 600;
+    text-align: left;
+}
+.cr-popup-setores button:hover {
+    border-color: #038242;
+    background: #eef7f1;
+}
+
+/* Modal de Confirmação / Progresso da Correção de Rotas */
+#crModalFundo {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 25, 18, 0.5);
+    z-index: 3500;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+#crModalFundo.lateral {
+    justify-content: flex-start;
+    align-items: flex-start;
+    padding: 72px 0 0 18px;
+    background: rgba(15, 25, 18, 0.2);
+}
+#crModalBox {
+    background: #FFFFFF;
+    border-radius: 14px;
+    max-width: 500px;
+    width: 100%;
+    max-height: 88vh;
+    overflow-y: auto;
+    padding: 20px;
+    box-shadow: 0 12px 42px rgba(0, 0, 0, 0.28);
+}
+#crModalFundo.lateral #crModalBox {
+    max-width: 390px;
+}
+#crModalBox h2 {
+    margin: 0 0 8px;
+    font-size: 17px;
+    color: var(--cr-texto);
+}
+#crModalBox .resumo {
+    background: #f6f8f5;
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 12.5px;
+    color: var(--cr-suave);
+    margin: 10px 0;
+    line-height: 1.45;
+}
+#crModalBox .rodape {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+}
+
+/* ==========================================================================
+   PAINEL ADMINISTRATIVO DE ANÁLISE DE SOLICITAÇÕES (MENU PRINCIPAL)
+   ========================================================================== */
+.sol-admin-grid {
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    gap: 14px;
+    height: calc(88vh - 135px);
+    min-height: 460px;
+}
+.sol-admin-lista {
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    overflow-y: auto;
+    background: #F8FAFC;
+}
+.sol-card-item {
+    padding: 11px 13px;
+    border-bottom: 1px solid #E2E8F0;
+    background: #FFFFFF;
+    cursor: pointer;
+    transition: background 0.12s;
+}
+.sol-card-item:hover {
+    background: #F1F5F9;
+}
+.sol-card-item.ativo {
+    background: #ECFDF5;
+    border-left: 4px solid #038242;
+}
+.sol-status-pill {
+    display: inline-block;
+    font-size: 0.66rem;
+    font-weight: 800;
+    padding: 2px 7px;
+    border-radius: 999px;
+    text-transform: uppercase;
+}
+.sol-status-PENDENTE { background: #FEF3C7; color: #92400E; }
+.sol-status-EM_ANALISE { background: #DBEAFE; color: #1E40AF; }
+.sol-status-APROVADA { background: #DCFCE7; color: #166534; }
+.sol-status-CONCLUIDA { background: #E2E8F0; color: #334155; }
+.sol-status-REJEITADA { background: #FEE2E2; color: #991B1B; }
+
+.sol-admin-detalhe {
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-y: auto;
+    background: #FFFFFF;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.sol-pdf-iframe {
+    width: 100%;
+    height: 480px;
+    border: 1px solid #CBD5E1;
+    border-radius: 8px;
+    background: #334155;
+}
+
+@media (max-width: 900px) {
+    #crPainelLateral {
+        width: 100%;
+        min-width: 0;
+        height: 56vh;
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        border-right: none;
+        border-top: 2px solid var(--cr-verde);
+    }
+    .sol-admin-grid {
+        grid-template-columns: 1fr;
+        height: auto;
+    }
+}

@@ -719,6 +719,32 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_snap_chave ON links_snapshot(chave_params);
             CREATE INDEX IF NOT EXISTS idx_snap_contrato ON links_snapshot(contrato_id, data_iso);
 
+            CREATE TABLE IF NOT EXISTS solicitacoes_correcao_rotas (
+                id TEXT PRIMARY KEY,
+                protocolo TEXT NOT NULL,
+                contrato_id TEXT NOT NULL,
+                contrato_nome TEXT NOT NULL,
+                snapshot_id TEXT,
+                periodo TEXT DEFAULT 'diario',
+                data_ref TEXT,
+                solicitante TEXT NOT NULL,
+                observacoes_gerais TEXT,
+                qtd_alteracoes INTEGER DEFAULT 0,
+                qtd_setores INTEGER DEFAULT 0,
+                setores_json TEXT,
+                pedidos_json TEXT NOT NULL,
+                geojson_gzip BLOB,
+                pdf_gzip BLOB,
+                pdf_filename TEXT,
+                tamanho_pdf INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'PENDENTE',
+                notas_analise TEXT DEFAULT '',
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sol_rotas_status ON solicitacoes_correcao_rotas(status, criado_em);
+            CREATE INDEX IF NOT EXISTS idx_sol_rotas_contrato ON solicitacoes_correcao_rotas(contrato_id, criado_em);
+
             CREATE TABLE IF NOT EXISTS engine_meta (
                 chave TEXT PRIMARY KEY,
                 valor TEXT

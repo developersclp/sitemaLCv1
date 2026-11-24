@@ -24,6 +24,7 @@ from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, Optional
 
+import correcao_rotas
 import database as db
 import indicadores
 import malha_rotas
@@ -178,6 +179,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <title>LOCAR - Mapa de Execução · Inlog, Auditoria & GIS</title>
     <!-- __SHARED_LOCK_INIT__ -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/static/correcao_rotas.css" />
     <script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1067,8 +1069,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <button class="btn-indicadores" id="btnPainelIndicadores" title="Abrir Painel de Indicadores e exportar Excel completo por cidade">
                 📈 Indicadores
             </button>
+            <button type="button" class="btn-admin-solicitacoes" id="btnAdminSolicitacoes" title="Analisar solicitações e PDFs de Correção de Rotas recebidos das empresas">
+                📋 Solicitações <span class="sol-badge-count" id="badgeSolicPendentes" style="display:none;">0</span>
+            </button>
             <button class="btn-inlog" id="btnCentralInlog" title="Central de Módulos da API Inlog">
                 📊 Central Inlog
+            </button>
+            <button type="button" class="btn-correcao-rotas" id="btnAbrirCorrecaoRotas" title="Abrir painel lateral de solicitação de correção de rotas e geração de PDF">
+                ✏️ Correção de Rotas
             </button>
             <button class="btn-locar" id="btnBaixarCsvLink" style="display:none;" title="Exportar relatório de ruas omitidas em CSV">
                 ⬇ Baixar CSV
@@ -1175,7 +1183,62 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <!-- MAIN CONTAINER -->
     <div class="main-container">
+        <!-- ABA LATERAL ESQUERDA: CORREÇÃO DE ROTAS (INTEGRADA AO MAPA E LINK) -->
+        <aside id="crPainelLateral">
+            <div class="cr-painel-topo">
+                <div>
+                    <div class="cr-painel-topo-titulo">✏️ Correção de Rotas</div>
+                    <div class="cr-painel-topo-sub" id="crTopoSub">Solicitação de alterações nos setores</div>
+                </div>
+                <button type="button" class="cr-btn-fechar-aba" id="crBtnFecharAba">✕ Voltar</button>
+            </div>
+            <div class="cr-painel-corpo">
+                <h3>1 · O que mostrar</h3>
+                <div class="cr-bloco">
+                    <label class="cr-rot" style="margin-top:0">Turno</label>
+                    <div class="cr-chips" id="crChipsTurno"></div>
+                    <label class="cr-rot">Setor</label>
+                    <div id="crListaSetores"></div>
+                    <label class="cr-rot">Mostrar ruas</label>
+                    <div class="cr-chips" id="crChipsRuas"></div>
+                    <label class="cr-rot">Buscar rua</label>
+                    <input type="text" class="cr-input" id="crBuscaRua" placeholder="Digite o nome da rua..." list="crListaRuas" />
+                    <datalist id="crListaRuas"></datalist>
+                </div>
+
+                <h3>2 · Escolher trechos</h3>
+                <div class="cr-bloco">
+                    <div class="cr-modos">
+                        <button type="button" class="cr-modo ativo" data-modo="clique"><span class="ic">👆</span>Clicar nas ruas</button>
+                        <button type="button" class="cr-modo" data-modo="laco"><span class="ic">✏️</span>Circular área</button>
+                        <button type="button" class="cr-modo" data-modo="add"><span class="ic">➕</span>Adicionar ruas</button>
+                    </div>
+                    <div class="cr-dica" id="crDicaModo"></div>
+                </div>
+
+                <div id="crSelecao" class="cr-bloco" style="display:none"></div>
+
+                <h3>
+                    3 · Minhas solicitações <span class="cr-contador" id="crContPedidos">0</span>
+                    <button type="button" class="cr-btn-link" id="crBtApagarTudo" style="float:right;color:#c0392b;display:none">Apagar todas</button>
+                </h3>
+                <div id="crPedidos"></div>
+                <div class="cr-bloco">
+                    <label class="cr-rot" style="margin-top:0">Seu nome / Empresa *</label>
+                    <input type="text" class="cr-input" id="crNomeSolic" placeholder="Nome de quem está solicitando" />
+                    <label class="cr-rot">Observações gerais (opcional)</label>
+                    <textarea class="cr-textarea" id="crObsGeral" placeholder="Algo que vale para a solicitação inteira"></textarea>
+                    <button type="button" class="cr-btn" id="crBtPdf" style="width:100%;margin-top:12px" disabled>
+                        📄 Finalizar, Enviar e Baixar PDF
+                    </button>
+                    <div class="cr-dica">Ao finalizar, o PDF será baixado no seu dispositivo e enviado automaticamente para análise da equipe Locar.</div>
+                </div>
+            </div>
+        </aside>
+
         <div id="map"></div>
+        <div id="crLegendaMapa"></div>
+        <div id="crAvisoMapa"></div>
         <button type="button" id="btnPrintMapaCidade" class="map-print-btn" title="Enquadrar cidade, tirar print do mapa e copiar texto para Ctrl+V">
             📸 Print Mapa + Copiar Texto
         </button>
@@ -1607,6 +1670,71 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- MODAL DE AÇÕES / PROGRESSO DA CORREÇÃO DE ROTAS -->
+    <div id="crModalFundo">
+        <div id="crModalBox"></div>
+    </div>
+
+    <!-- MODAL ADMINISTRATIVO (MENU PRINCIPAL): RECEBIMENTO E ANÁLISE DE SOLICITAÇÕES DE ROTAS -->
+    <div class="modal-backdrop" id="modalAdminSolicitacoes" style="display:none;">
+        <div class="modal-card modal-xl">
+            <div class="modal-header">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <div class="modal-icon-badge">📋</div>
+                    <div>
+                        <h3 class="modal-title">Central de Análise — Solicitações de Correção de Rotas</h3>
+                        <div style="font-size:0.74rem; color:#64748B;">PDFs e arquivos técnicos (.geojson) enviados pelas empresas pelo Link Compartilhado</div>
+                    </div>
+                </div>
+                <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <select id="solFiltroCidade" class="cr-select" style="width:auto; padding:5px 8px; font-size:0.76rem;">
+                        <option value="all">Todas as Cidades</option>
+                        <option value="cabo">Cabo de Santo Agostinho</option>
+                        <option value="jaboatao">Jaboatão dos Guararapes</option>
+                        <option value="olinda">Olinda</option>
+                        <option value="paulista">Paulista</option>
+                        <option value="caruaru">Caruaru</option>
+                        <option value="cuiaba">Cuiabá</option>
+                        <option value="garanhuns">Garanhuns</option>
+                        <option value="pesqueira">Pesqueira</option>
+                        <option value="vitoria">Vitória de Santo Antão</option>
+                        <option value="canela">Canela</option>
+                        <option value="jequie">Jequié</option>
+                        <option value="novo hamburgo">Novo Hamburgo</option>
+                    </select>
+                    <select id="solFiltroStatus" class="cr-select" style="width:auto; padding:5px 8px; font-size:0.76rem;">
+                        <option value="ALL">Todos os Status</option>
+                        <option value="PENDENTE">⏳ Pendentes</option>
+                        <option value="EM_ANALISE">🔎 Em Análise</option>
+                        <option value="APROVADA">✅ Aprovadas</option>
+                        <option value="CONCLUIDA">🏁 Concluídas</option>
+                        <option value="REJEITADA">❌ Rejeitadas</option>
+                    </select>
+                    <button type="button" class="btn-outline" id="btnSolImportarPdf" title="Importar um PDF de solicitação recebido externamente">
+                        📤 Importar PDF
+                    </button>
+                    <input type="file" id="inputSolImportarPdf" accept=".pdf,application/pdf" style="display:none;" />
+                    <button type="button" class="btn-outline" id="btnSolExtrairGeoAvulso" title="Extrair apenas o .geojson técnico de um PDF local">
+                        🌍 Extrair .geojson
+                    </button>
+                    <input type="file" id="inputSolExtrairGeoAvulso" accept=".pdf,application/pdf" style="display:none;" />
+                    <button type="button" class="btn-outline" id="btnSolAtualizarLista">🔄 Atualizar</button>
+                    <button type="button" class="btn-close-modal" id="btnFecharAdminSolicitacoes">✕</button>
+                </div>
+            </div>
+            <div class="modal-body" style="padding:14px 18px; overflow:hidden;">
+                <div class="sol-admin-grid">
+                    <div class="sol-admin-lista" id="solListaContainer"></div>
+                    <div class="sol-admin-detalhe" id="solDetalheContainer">
+                        <div style="margin:auto; text-align:center; color:#94A3B8; padding:40px;">
+                            Selecione uma solicitação à esquerda para ler o PDF, baixar o GeoJSON técnico para o QGIS ou registrar o parecer da análise.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="locarToast" class="locar-toast">✔ Ação concluída!</div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -1957,6 +2085,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
                 popularSelectsFiltros(dataRes);
                 renderizarResultado();
+                if (typeof window.onAuditoriaAtualizadaCorrecao === 'function') {
+                    window.onAuditoriaAtualizadaCorrecao();
+                }
                 if (reqId === auditReqSeq) {
                     document.getElementById('loadingOverlay').style.display = 'none';
                 }
@@ -4022,6 +4153,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
             sidebarMobileHeader.addEventListener('click', alternarPainelMobile);
         }
 
+        window.__SISTEMA_LC__ = {
+            getMap: () => map,
+            getAudit: () => currentAudit,
+            getFeatures: () => currentFeatures,
+            getSetores: () => setoresList,
+            getSharedInfo: () => ({
+                isSharedLink: isSharedLinkMode,
+                snapshotId: sharedSnapshotId,
+                token: sharedToken,
+                periodo: sharedPeriodo
+            }),
+            mostrarToast: mostrarToast,
+            suspenderMapaPadrao: (suspender) => {
+                if (!map) return;
+                if (suspender) {
+                    if (geojsonLayer && map.hasLayer(geojsonLayer)) map.removeLayer(geojsonLayer);
+                    if (priorityHaloLayer && map.hasLayer(priorityHaloLayer)) map.removeLayer(priorityHaloLayer);
+                    if (sectorLabelsLayer && map.hasLayer(sectorLabelsLayer)) map.removeLayer(sectorLabelsLayer);
+                } else {
+                    if (priorityHaloLayer && !map.hasLayer(priorityHaloLayer)) priorityHaloLayer.addTo(map);
+                    if (sectorLabelsLayer && !map.hasLayer(sectorLabelsLayer)) sectorLabelsLayer.addTo(map);
+                    if (currentAudit) renderizarResultado();
+                }
+            }
+        };
+
         window.onload = () => {
             checkUrlParams();
             initMap();
@@ -4033,6 +4190,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             carregarAuditoria(false);
         };
     </script>
+    <script src="/static/correcao_rotas.js"></script>
 </body>
 </html>
 """
@@ -4393,9 +4551,116 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(csv_str.encode("utf-8-sig"))
             return
 
+        # 3a. Recursos auxiliares para Correção de Rotas (permitidos no Link Compartilhado e Painel Central)
+        if path == "/api/correcao-rotas/setores-contrato":
+            snap_q = query.get("snapshot_id", [""])[0].strip()
+            tok_q = query.get("token", [""])[0].strip()
+            lock_eff = viewer_lock
+            if not is_admin and not lock_eff:
+                if snap_q:
+                    sm = snapshots.obter_snapshot_meta(snap_q)
+                    if sm:
+                        lock_eff = {"snapshot_id": sm["id"], **sm["params"]}
+                elif tok_q:
+                    lock_eff = validar_token_compartilhamento(tok_q)
+            if (not is_admin) and (not lock_eff) and REQUIRE_ADMIN_LOGIN:
+                self._send_json({"sucesso": False, "erro": "Acesso não autorizado."}, status=403)
+                return
+            cidade_req = lock_eff["cidade"] if (lock_eff and not is_admin) else query.get("cidade", ["cabo"])[0]
+            self._send_json({
+                "sucesso": True,
+                "cidade": cidade_req,
+                "setores": correcao_rotas.listar_setores_contrato(cidade_req),
+            })
+            return
+
+        if path == "/api/correcao-rotas/malha-candidata":
+            snap_q = query.get("snapshot_id", [""])[0].strip()
+            tok_q = query.get("token", [""])[0].strip()
+            lock_eff = viewer_lock
+            if not is_admin and not lock_eff:
+                if snap_q:
+                    sm = snapshots.obter_snapshot_meta(snap_q)
+                    if sm:
+                        lock_eff = {"snapshot_id": sm["id"], **sm["params"]}
+                elif tok_q:
+                    lock_eff = validar_token_compartilhamento(tok_q)
+            if (not is_admin) and (not lock_eff) and REQUIRE_ADMIN_LOGIN:
+                self._send_json({"type": "FeatureCollection", "features": [], "erro": "Não autorizado"}, status=403)
+                return
+            cidade_req = (lock_eff["cidade"] if (lock_eff and not is_admin) else query.get("cidade", ["cabo"])[0]).lower().strip()
+            bbox_raw = query.get("bbox", [""])[0]
+            try:
+                partes = [float(x) for x in bbox_raw.split(",")]
+                if len(partes) != 4:
+                    raise ValueError
+                bbox = (partes[0], partes[1], partes[2], partes[3])
+            except ValueError:
+                self._send_json({"type": "FeatureCollection", "features": [], "erro": "bbox inválido"})
+                return
+            self._send_json(malha_rotas.malha_viewport(cidade_req, bbox))
+            return
+
         # Demais APIs internas e Inlog: exigem sessão administrativa autenticada
         if path.startswith("/api/") and (not is_admin) and (viewer_lock is not None or REQUIRE_ADMIN_LOGIN):
             self._send_json({"sucesso": False, "erro": "Acesso restrito ao Painel Central autenticado."}, status=403)
+            return
+
+        # 3e. Central Administrativa de Solicitações de Correção de Rotas (somente Admin autenticado)
+        if path == "/api/correcao-rotas/listar":
+            cid_f = query.get("cidade", [None])[0]
+            st_f = query.get("status", [None])[0]
+            res_lst = correcao_rotas.listar_solicitacoes(contrato_id=cid_f, status=st_f)
+            self._send_json({"sucesso": True, **res_lst})
+            return
+
+        if path == "/api/correcao-rotas/detalhe":
+            sol_id = query.get("id", [""])[0].strip()
+            det = correcao_rotas.obter_detalhe_solicitacao(sol_id)
+            if not det:
+                self._send_json({"sucesso": False, "erro": "Solicitação não encontrada."}, status=404)
+                return
+            self._send_json({"sucesso": True, "solicitacao": det})
+            return
+
+        if path == "/api/correcao-rotas/pdf":
+            sol_id = query.get("id", [""])[0].strip()
+            forcar_dl = query.get("download", ["0"])[0] == "1"
+            arq_pdf = correcao_rotas.obter_pdf_solicitacao(sol_id)
+            if not arq_pdf:
+                self._send_json({"sucesso": False, "erro": "PDF não disponível para esta solicitação."}, status=404)
+                return
+            pdf_bytes, filename = arq_pdf
+            safe_ascii = filename.replace('"', "")
+            quoted_utf8 = urllib.parse.quote(filename)
+            disp_mode = "attachment" if forcar_dl else "inline"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", f'{disp_mode}; filename="{safe_ascii}"; filename*=UTF-8\'\'{quoted_utf8}')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, no-cache")
+            self.send_header("Content-Length", str(len(pdf_bytes)))
+            self.end_headers()
+            self.wfile.write(pdf_bytes)
+            return
+
+        if path == "/api/correcao-rotas/geojson":
+            sol_id = query.get("id", [""])[0].strip()
+            arq_geo = correcao_rotas.obter_geojson_solicitacao(sol_id)
+            if not arq_geo:
+                self._send_json({"sucesso": False, "erro": "Arquivo GeoJSON técnico não encontrado."}, status=404)
+                return
+            geo_bytes, filename = arq_geo
+            safe_ascii = filename.replace('"', "")
+            quoted_utf8 = urllib.parse.quote(filename)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/geo+json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{quoted_utf8}')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(geo_bytes)))
+            self.end_headers()
+            self.wfile.write(geo_bytes)
             return
 
         # 3b. Listar Snapshots Gerados (Painel Central)
@@ -4770,8 +5035,66 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"sucesso": False, "erro": "Chave de acesso inválida."}, status=401)
             return
 
+        # 0a. Envio de Solicitação de Correção de Rotas (permitido pelo Link Compartilhado ou Painel Central)
+        if path == "/api/correcao-rotas/enviar":
+            snap_b = str(dados.get("snapshot_id") or "").strip()
+            tok_b = str(dados.get("token") or "").strip()
+            lock_eff = viewer_lock
+            if not is_admin and not lock_eff:
+                if snap_b:
+                    sm = snapshots.obter_snapshot_meta(snap_b)
+                    if sm:
+                        lock_eff = {"snapshot_id": sm["id"], **sm["params"]}
+                elif tok_b:
+                    lock_eff = validar_token_compartilhamento(tok_b)
+            if (not is_admin) and (not lock_eff) and REQUIRE_ADMIN_LOGIN:
+                self._send_json({"sucesso": False, "erro": "Envio não autorizado."}, status=403)
+                return
+            try:
+                if lock_eff and not is_admin:
+                    if lock_eff.get("cidade"):
+                        dados["contrato_id"] = lock_eff["cidade"]
+                    if lock_eff.get("snapshot_id"):
+                        dados["snapshot_id"] = lock_eff["snapshot_id"]
+                salvo = correcao_rotas.salvar_solicitacao(dados)
+                self._send_json({"sucesso": True, **salvo})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
         if (not is_admin) and (viewer_lock is not None or REQUIRE_ADMIN_LOGIN):
             self._send_json({"sucesso": False, "erro": "Ação bloqueada: sessão restrita ao modo visualização."}, status=403)
+            return
+
+        # 0e. Gestão Administrativa de Solicitações de Correção de Rotas (somente Admin)
+        if path == "/api/correcao-rotas/status":
+            try:
+                sol_id = str(dados.get("id") or "").strip()
+                novo_status = str(dados.get("status") or "").strip()
+                notas = dados.get("notas_analise")
+                ok = correcao_rotas.atualizar_status_solicitacao(sol_id, novo_status, notas_analise=notas)
+                self._send_json({"sucesso": ok})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        if path == "/api/correcao-rotas/importar-pdf":
+            try:
+                pdf_b64 = str(dados.get("pdf_base64") or "")
+                fname = str(dados.get("filename") or "Solicitacao_Importada.pdf")
+                imp = correcao_rotas.importar_pdf_externo(pdf_b64, filename=fname)
+                self._send_json({"sucesso": True, **imp})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        if path == "/api/correcao-rotas/excluir":
+            try:
+                sol_id = str(dados.get("id") or "").strip()
+                ok = correcao_rotas.excluir_solicitacao(sol_id)
+                self._send_json({"sucesso": ok})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return
 
         # 0b. Gerar Link Snapshot Congelado (ou atualizar se o dia ainda estiver em andamento)
