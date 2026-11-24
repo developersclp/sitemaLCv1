@@ -1650,6 +1650,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let activeGisTool = 'select';
         let autoRefreshTimer = null;
         let activeCentralTab = 'frota';
+        let auditReqSeq = 0;
+        let auditAbortController = null;
 
         const CIDADES_MAPA = {
             'all': 'Todas as Cidades (Visão Geral)',
@@ -1881,6 +1883,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         async function carregarAuditoria(forcar = false) {
+            const reqId = ++auditReqSeq;
+            if (auditAbortController) {
+                try { auditAbortController.abort(); } catch (_) {}
+            }
+            auditAbortController = new AbortController();
+            const signal = auditAbortController.signal;
+
             const cidade = document.getElementById('selectCidade').value;
             const operacaoSelecionada = document.getElementById('selectOperacao').value;
             const operacaoApi = 'COLETA';
@@ -1900,8 +1909,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     if (sharedPeriodo && sharedPeriodo !== 'diario') url += `&periodo=${encodeURIComponent(sharedPeriodo)}`;
                     if (sharedToken) url += `&token=${encodeURIComponent(sharedToken)}`;
                 }
-                const resp = await fetch(url);
+                const resp = await fetch(url, { signal });
+                if (reqId !== auditReqSeq) return;
                 const dataRes = await resp.json();
+                if (reqId !== auditReqSeq) return;
 
                 if (dataRes.erro) {
                     mostrarToast('Aviso: ' + dataRes.erro);
@@ -1909,7 +1920,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 }
 
                 currentAudit = dataRes;
-                currentFeatures = dataRes.geojson.features || [];
+                currentFeatures = (dataRes.geojson && dataRes.geojson.features) || [];
                 setoresList = dataRes.setores || [];
                 setorTurnoMap = {};
                 setoresList.forEach(s => {
@@ -1953,12 +1964,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
                 popularSelectsFiltros(dataRes);
                 renderizarResultado();
-                await atualizarCamadasInlog(forcar);
+                if (reqId === auditReqSeq) {
+                    document.getElementById('loadingOverlay').style.display = 'none';
+                }
+                // Atualiza camadas secundárias em tempo real sem travar o overlay do mapa
+                atualizarCamadasInlog(forcar).catch(() => {});
             } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                if (reqId !== auditReqSeq) return;
                 console.error(err);
-                mostrarToast('Erro de comunicação com o servidor local.');
+                mostrarToast('Erro de comunicação com o servidor.');
             } finally {
-                document.getElementById('loadingOverlay').style.display = 'none';
+                if (reqId === auditReqSeq) {
+                    document.getElementById('loadingOverlay').style.display = 'none';
+                }
             }
         }
 
@@ -2076,11 +2095,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         async function carregarVeiculosTempoRealMapa(force = false) {
+            const reqId = auditReqSeq;
             const cidade = document.getElementById('selectCidade').value;
             const operacao = document.getElementById('selectOperacao').value;
             try {
                 const resp = await fetch(`/api/inlog/veiculos-tempo-real?cidade=${encodeURIComponent(cidade)}&operacao=${encodeURIComponent(operacao)}&force=${force}`);
                 const data = await resp.json();
+                if (reqId !== auditReqSeq || document.getElementById('selectCidade').value !== cidade) return;
                 vehiclesRtLayer.clearLayers();
                 const veiculos = data.veiculos || [];
                 document.getElementById('pillVeiculosRT').innerText = veiculos.length;
@@ -2134,6 +2155,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         async function carregarRastroGpsMapa() {
+            const reqId = auditReqSeq;
             const cidade = document.getElementById('selectCidade').value;
             const operacao = document.getElementById('selectOperacao').value;
             const data = document.getElementById('inputData').value;
@@ -2142,6 +2164,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             try {
                 const resp = await fetch(`/api/inlog/rastro-gps?cidade=${encodeURIComponent(cidade)}&data=${encodeURIComponent(data)}&operacao=${encodeURIComponent(operacao)}&placa=${encodeURIComponent(placa)}`);
                 const res = await resp.json();
+                if (reqId !== auditReqSeq || document.getElementById('selectCidade').value !== cidade || document.getElementById('inputData').value !== data) return;
                 gpsTrailLayer.clearLayers();
                 document.getElementById('pillRastroGPS').innerText = `${res.total_pontos || 0} pts`;
 
@@ -2185,11 +2208,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         async function carregarEventosMapa(force = false) {
+            const reqId = auditReqSeq;
             const cidade = document.getElementById('selectCidade').value;
             const data = document.getElementById('inputData').value;
             try {
                 const resp = await fetch(`/api/inlog/alarmes-falhas?cidade=${encodeURIComponent(cidade)}&data=${encodeURIComponent(data)}&force=${force}`);
                 const res = await resp.json();
+                if (reqId !== auditReqSeq || document.getElementById('selectCidade').value !== cidade || document.getElementById('inputData').value !== data) return;
                 eventsLayer.clearLayers();
 
                 const alarmes = res.alarmes || [];
@@ -3739,10 +3764,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('btnConsultar').addEventListener('click', () => carregarAuditoria(true));
         document.getElementById('selectCidade').addEventListener('change', (e) => {
             const cid = e.target.value;
-            if (!isSharedLinkMode) selectedSectors.clear();
+            if (!isSharedLinkMode) {
+                selectedSectors.clear();
+                const fv = document.getElementById('filterVeiculo');
+                if (fv) fv.value = 'all';
+            }
+            if (geojsonLayer && map) { map.removeLayer(geojsonLayer); geojsonLayer = null; }
+            if (priorityHaloLayer) priorityHaloLayer.clearLayers();
+            if (sectorLabelsLayer) sectorLabelsLayer.clearLayers();
+            if (vehiclesRtLayer) vehiclesRtLayer.clearLayers();
+            if (gpsTrailLayer) gpsTrailLayer.clearLayers();
+            if (eventsLayer) eventsLayer.clearLayers();
+            if (plannedRouteLayer) plannedRouteLayer.clearLayers();
+            if (baseMeshLayer) baseMeshLayer.clearLayers();
             const coord = CIDADES_COORDENADAS[cid];
             if (coord && map) {
-                map.flyTo(coord.centro, coord.zoom, { duration: 1.2 });
+                map.flyTo(coord.centro, coord.zoom, { duration: 1.0 });
                 lastCenteredCity = cid;
             }
             carregarAuditoria(false);

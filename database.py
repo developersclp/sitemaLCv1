@@ -61,8 +61,17 @@ def _resolver_db_path() -> str:
     return alvo
 
 
+class _NoopLock:
+    """Lock no-op para PostgreSQL (que já possui MVCC nativo sem travar escritas globais)."""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 DB_PATH = _resolver_db_path()
-_write_lock = threading.RLock()
+_write_lock = _NoopLock() if IS_POSTGRES else threading.RLock()
 
 
 def _normalize_pg_val(val: Any) -> Any:
@@ -163,10 +172,42 @@ class _PgCursor:
         return self
 
     def executemany(self, sql: str, seq_of_params):
+        rows = list(seq_of_params)
+        if not rows:
+            self.rowcount = 0
+            return self
         pg_sql, _ = _translate_sql_for_pg(sql)
         # Remove RETURNING em executemany em lote
-        pg_sql = re.sub(r"\s+RETURNING\s+id\s*$", "", pg_sql, flags=re.IGNORECASE)
-        self._cur.executemany(pg_sql, seq_of_params)
+        pg_sql = re.sub(r"\s+RETURNING\s+id\s*$", "", pg_sql, flags=re.IGNORECASE).strip().rstrip(";")
+
+        # Acelera inserções em lote (segmentos_viarios, auditoria_detalhes, inlog_historico_gps)
+        # usando multi-row VALUES (...), (...), ... quando não há ON CONFLICT ... DO UPDATE.
+        if len(rows) > 1 and "DO UPDATE" not in pg_sql.upper():
+            m = re.match(
+                r"^(\s*INSERT\s+INTO\s+[\s\S]+?\bVALUES\s*)\(([^()]+)\)(\s*(?:ON\s+CONFLICT[\s\S]*)?)$",
+                pg_sql,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                prefix, row_tpl, suffix = m.group(1), m.group(2), m.group(3)
+                n_ph = row_tpl.count("%s")
+                if n_ph > 0 and len(rows[0]) == n_ph:
+                    chunk_size = 500
+                    total_rc = 0
+                    single_group = f"({row_tpl})"
+                    for i in range(0, len(rows), chunk_size):
+                        chunk = rows[i:i + chunk_size]
+                        multi_sql = prefix + ",".join([single_group] * len(chunk)) + suffix
+                        flat_params = []
+                        for r in chunk:
+                            flat_params.extend(r)
+                        self._cur.execute(multi_sql, flat_params)
+                        if self._cur.rowcount and self._cur.rowcount > 0:
+                            total_rc += self._cur.rowcount
+                    self.rowcount = total_rc
+                    return self
+
+        self._cur.executemany(pg_sql, rows)
         self.rowcount = self._cur.rowcount
         return self
 

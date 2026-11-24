@@ -899,11 +899,12 @@ def _lock_cidade(contrato_id: str) -> threading.Lock:
 
 
 def _assinatura_fontes(contrato_id: str) -> Tuple[Optional[str], float, float, int]:
+    """Assinatura determinística baseada no tamanho dos arquivos (estável entre deploys Docker)."""
     malha = arquivo_malha(contrato_id)
-    malha_mtime = os.path.getmtime(malha) if malha else 0.0
+    malha_sig = float(os.path.getsize(malha)) if malha and os.path.isfile(malha) else 0.0
     rotas = listar_rotas_cidade(contrato_id)
-    rotas_mtime = max((r["mtime"] for r in rotas), default=0.0)
-    return malha, round(malha_mtime, 1), round(rotas_mtime, 1), len(rotas)
+    rotas_sig = float(sum(os.path.getsize(r["path"]) for r in rotas if os.path.isfile(r["path"])))
+    return malha, malha_sig, rotas_sig, len(rotas)
 
 
 def status_projeto(contrato_id: str) -> Optional[Dict[str, Any]]:
