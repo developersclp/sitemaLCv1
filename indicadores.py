@@ -15,6 +15,7 @@ Gera o relatório oficial "Indicadores - Mapa de Execução.xlsx" com:
 import calendar
 import io
 import json
+import math
 import re
 import secrets
 import threading
@@ -22,7 +23,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -91,12 +92,36 @@ _JOBS_LOCK = threading.Lock()
 _JOBS: Dict[str, Dict[str, Any]] = {}
 _JOB_TTL_SECONDS = 3600  # Mantém arquivos gerados em memória por 1 hora
 
+_RE_XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_PLACAS_SIMULADAS_FALLBACK = {"LOC-1010", "LOC-2020"}
+
+
+def _sanitizar_texto_excel(valor: Any) -> Optional[str]:
+    """Remove caracteres de controle ilegais em XML 1.0 para evitar corrupção do XLSX."""
+    if valor is None:
+        return None
+    return _RE_XML_INVALID.sub("", str(valor))
+
 
 def _sanitizar_nome_aba(nome: str) -> str:
     """Garante nome de aba válido no Excel (máx. 31 caracteres, sem caracteres proibidos)."""
-    limpo = re.sub(r"[:\\/?*\[\]]", " ", str(nome or "Cidade")).strip()
+    limpo = _sanitizar_texto_excel(nome) or "Cidade"
+    limpo = re.sub(r"[:\\/?*\[\]]", " ", limpo).strip()
     limpo = re.sub(r"\s+", " ", limpo)
     return (limpo or "Cidade")[:31]
+
+
+def _garantir_nome_aba_unico(nome: str, usados_lower: Set[str]) -> str:
+    """Garante nome de aba único (case-insensitive) dentro do limite de 31 caracteres do Excel."""
+    base = _sanitizar_nome_aba(nome)
+    cand = base
+    suf_idx = 2
+    while cand.lower() in usados_lower:
+        suf = f" ({suf_idx})"
+        cand = f"{base[:max(1, 31 - len(suf))]}{suf}"
+        suf_idx += 1
+    usados_lower.add(cand.lower())
+    return cand
 
 
 def _chave_ordenacao_setor(setor_nome: str) -> Tuple[int, str, str]:
@@ -122,7 +147,7 @@ def resolver_periodo_indicadores(
                     corta automaticamente até a data de hoje.
     """
     modo_norm = str(modo or "dia").lower().strip()
-    hoje = date.today()
+    hoje = datetime.now().date()
 
     if modo_norm == "mes":
         raw_mes = str(mes_str or "").strip()
@@ -254,7 +279,11 @@ def _carregar_segmentos_cidade(contrato_id: str) -> List[Dict[str, Any]]:
     return segs
 
 
-def _auditoria_em_cache_valida(contrato_id: str, data_iso: str) -> Optional[int]:
+def _auditoria_em_cache_valida(
+    contrato_id: str,
+    data_iso: str,
+    inlog_configurado: bool = True,
+) -> Optional[int]:
     """
     Retorna o audit_id já salvo no banco (turno DIURNO ou TODOS) caso seja válido
     e não obsoleto, evitando reprocessamento redundante na API Inlog.
@@ -278,8 +307,8 @@ def _auditoria_em_cache_valida(contrato_id: str, data_iso: str) -> Optional[int]
         conn.close()
 
     for aud in rows:
-        criado_em = str(aud["criado_em"] or "")
-        if len(criado_em) < 19 or "T" not in criado_em:
+        criado_em = str(aud["criado_em"] or "").strip().replace(" ", "T")[:19]
+        if len(criado_em) != 19 or criado_em[10] != "T":
             continue
         # Se a janela operacional ainda não fechou quando a auditoria foi gerada e já avançou
         if criado_em < win_op["data_fim"] and agora_str > criado_em:
@@ -290,14 +319,20 @@ def _auditoria_em_cache_valida(contrato_id: str, data_iso: str) -> Optional[int]
                 placas = []
         except Exception:
             placas = []
+        somente_placas_simuladas = (
+            inlog_configurado
+            and bool(placas)
+            and all(str(p).upper().strip() in _PLACAS_SIMULADAS_FALLBACK for p in placas)
+        )
+        sem_placas_reais = (len(placas) == 0) or somente_placas_simuladas
         auditoria_vazia = (
             float(aud["pct_cobertura"] or 0.0) <= 0.0
-            and len(placas) == 0
+            and sem_placas_reais
             and data_iso <= hoje_str
         )
         if auditoria_vazia:
             try:
-                dt_c = datetime.strptime(criado_em[:19], "%Y-%m-%dT%H:%M:%S")
+                dt_c = datetime.strptime(criado_em, "%Y-%m-%dT%H:%M:%S")
                 if (datetime.now() - dt_c).total_seconds() >= 60.0:
                     continue
             except Exception:
@@ -306,20 +341,39 @@ def _auditoria_em_cache_valida(contrato_id: str, data_iso: str) -> Optional[int]
     return None
 
 
-def _garantir_auditoria_dia(engine: Any, contrato_id: str, data_iso: str) -> Optional[int]:
+def _garantir_auditoria_dia(
+    engine: Any,
+    contrato_id: str,
+    data_iso: str,
+    inlog_configurado: bool = True,
+) -> Optional[int]:
     """Obtém o audit_id válido do cache ou executa o motor espacial para o dia."""
-    audit_id = _auditoria_em_cache_valida(contrato_id, data_iso)
+    audit_id = _auditoria_em_cache_valida(
+        contrato_id,
+        data_iso,
+        inlog_configurado=inlog_configurado,
+    )
     if audit_id is not None:
         return audit_id
 
-    res = engine.processar_ou_obter_auditoria(
-        contrato_id=contrato_id,
-        data_iso=data_iso,
-        turno="DIURNO",
-        forcar_reprocessamento=False,
-        operacao="COLETA",
-    )
-    aid = (res.get("resumo") or {}).get("id")
+    try:
+        res = engine.processar_ou_obter_auditoria(
+            contrato_id=contrato_id,
+            data_iso=data_iso,
+            turno="DIURNO",
+            forcar_reprocessamento=False,
+            operacao="COLETA",
+            incluir_geojson=False,
+        )
+    except TypeError:
+        res = engine.processar_ou_obter_auditoria(
+            contrato_id=contrato_id,
+            data_iso=data_iso,
+            turno="DIURNO",
+            forcar_reprocessamento=False,
+            operacao="COLETA",
+        )
+    aid = (res.get("resumo") or {}).get("id") if isinstance(res, dict) else None
     if aid:
         return int(aid)
 
@@ -387,7 +441,7 @@ def calcular_linhas_dia_cidade(
     seguindo 100% as regras matemáticas e de nulidade do arquivo oficial de referência.
     """
     contrato_id = contrato["id"]
-    contrato_codigo = contrato["contrato_codigo"]
+    contrato_codigo = _sanitizar_texto_excel(contrato["contrato_codigo"]) or ""
     dt_atual = datetime.strptime(data_iso, "%Y-%m-%d").date()
 
     def _eh_agendado(setor_nome: str) -> bool:
@@ -408,9 +462,17 @@ def calcular_linhas_dia_cidade(
         if not ativos:
             continue
         st, placas = detalhes_auditoria.get(seg["id"], ("not_collected", []))
-        ext_m = seg["extensao_m"]
+        ext_m_raw = float(seg["extensao_m"] or 0.0)
+        ext_m = ext_m_raw if (math.isfinite(ext_m_raw) and ext_m_raw >= 0.0) else 0.0
+        placas_unicas: List[str] = []
+        placas_vistas: Set[str] = set()
+        for pl in placas:
+            pl_limpa = (_sanitizar_texto_excel(pl) or "").strip()
+            if pl_limpa and pl_limpa not in placas_vistas:
+                placas_vistas.add(pl_limpa)
+                placas_unicas.append(pl_limpa)
         for s_nome in ativos:
-            segs_por_setor[s_nome].append((ext_m, st, placas))
+            segs_por_setor[s_nome].append((ext_m, st, placas_unicas))
 
     # Caso não haja setores agendados na data (ex.: domingos sem SCDOM* / DOM)
     if not segs_por_setor:
@@ -579,7 +641,7 @@ def calcular_linhas_dia_cidade(
             metros_man_contrato_r,
             pct_man_contrato,
             qtd_setores,
-            ms["setor"],
+            _sanitizar_texto_excel(ms["setor"]),
             pct_col_setor,
             _arred1(prev_m),
             _arred1(col_m),
@@ -645,19 +707,49 @@ def gerar_excel_indicadores(
     dias_iso: List[str] = periodo["dias_iso"]
     gerado_em = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    inlog_obj = getattr(engine, "inlog", None)
+    if inlog_obj is not None and callable(getattr(inlog_obj, "is_configured", None)):
+        inlog_configurado = bool(inlog_obj.is_configured())
+    else:
+        inlog_configurado = True
+
+    if inlog_obj is not None and inlog_configurado and callable(getattr(inlog_obj, "get_veiculos_tempo_real", None)):
+        try:
+            inlog_obj.get_veiculos_tempo_real()
+        except Exception as e:
+            print(f"[INDICADORES] Aviso ao pré-aquecer frota Inlog: {e}")
+
     etapas_total = max(1, len(contratos) * len(dias_iso))
-    etapas_concluidas = 0
+    unidades_total = max(1, etapas_total * 2)
+    unidades_concluidas = 0
 
     wb = openpyxl.Workbook()
     # Remove aba padrão inicial
     wb.remove(wb.active)
 
     resumo_cidades: List[Dict[str, Any]] = []
+    avisos: List[str] = []
+    abas_usadas: Set[str] = set()
     total_linhas_geral = 0
+
+    def _emitir_progresso(cidade_atual: str, data_atual: str, pct_override: Optional[float] = None) -> None:
+        if not progress_cb:
+            return
+        etapas_est = min(etapas_total, unidades_concluidas // 2)
+        pct_calc = round(min(99.5, unidades_concluidas / unidades_total * 100.0), 1)
+        progress_cb({
+            "cidade_atual": cidade_atual,
+            "data_atual": data_atual,
+            "etapas_concluidas": etapas_est,
+            "etapas_total": etapas_total,
+            "progresso_pct": pct_override if pct_override is not None else pct_calc,
+            "resumo_cidades": list(resumo_cidades),
+            "avisos": list(avisos),
+        })
 
     for contrato in contratos:
         cid = contrato["id"]
-        nome_aba = contrato["aba"]
+        nome_aba = _garantir_nome_aba_unico(contrato["aba"], abas_usadas)
         segs_cidade = _carregar_segmentos_cidade(cid)
         vis_cache: Dict[Tuple[str, str], bool] = {}
 
@@ -684,17 +776,29 @@ def gerar_excel_indicadores(
         audit_ids_por_dia: Dict[str, Optional[int]] = {}
         dias_faltantes: List[str] = []
         for d_iso in dias_com_agenda:
-            aid_cache = _auditoria_em_cache_valida(cid, d_iso)
+            aid_cache = _auditoria_em_cache_valida(
+                cid, d_iso, inlog_configurado=inlog_configurado
+            )
             if aid_cache is not None:
                 audit_ids_por_dia[d_iso] = aid_cache
             else:
                 dias_faltantes.append(d_iso)
 
+        # Dias sem agenda ou já em cache válido contam imediatamente na fase de auditoria
+        unidades_concluidas += max(0, len(dias_iso) - len(dias_faltantes))
+
         if dias_faltantes:
-            workers = min(3, len(dias_faltantes))
+            _emitir_progresso(contrato["nome"], f"Auditando {dias_faltantes[0]}...")
+            workers = min(3 if db.IS_POSTGRES else 2, len(dias_faltantes))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {
-                    pool.submit(_garantir_auditoria_dia, engine, cid, d_iso): d_iso
+                    pool.submit(
+                        _garantir_auditoria_dia,
+                        engine,
+                        cid,
+                        d_iso,
+                        inlog_configurado,
+                    ): d_iso
                     for d_iso in dias_faltantes
                 }
                 for fut in as_completed(futs):
@@ -702,8 +806,14 @@ def gerar_excel_indicadores(
                     try:
                         audit_ids_por_dia[d_f] = fut.result()
                     except Exception as e:
-                        print(f"[INDICADORES] Aviso ao auditar {cid} em {d_f}: {e}")
+                        msg_aviso = f"{contrato['nome']} ({d_f}): {e}"
+                        print(f"[INDICADORES] Aviso ao auditar {msg_aviso}")
+                        avisos.append(msg_aviso)
                         audit_ids_por_dia[d_f] = None
+                    unidades_concluidas += 1
+                    _emitir_progresso(contrato["nome"], d_f)
+        else:
+            _emitir_progresso(contrato["nome"], dias_iso[0] if dias_iso else periodo["data_inicial_iso"])
 
         # Cria aba da cidade com cabeçalho idêntico ao arquivo oficial
         ws = wb.create_sheet(title=nome_aba)
@@ -724,16 +834,6 @@ def gerar_excel_indicadores(
         linhas_aba = 0
 
         for d_iso in dias_iso:
-            if progress_cb:
-                progress_cb({
-                    "cidade_atual": contrato["nome"],
-                    "data_atual": d_iso,
-                    "etapas_concluidas": etapas_concluidas,
-                    "etapas_total": etapas_total,
-                    "progresso_pct": round(etapas_concluidas / etapas_total * 100.0, 1),
-                    "resumo_cidades": list(resumo_cidades),
-                })
-
             detalhes = _carregar_detalhes_auditoria(audit_ids_por_dia.get(d_iso)) if d_iso in audit_ids_por_dia else {}
             linhas_dia, res_dia = calcular_linhas_dia_cidade(
                 contrato=contrato,
@@ -763,7 +863,8 @@ def gerar_excel_indicadores(
                 soma_fgps_m += res_dia["fgps_m"]
                 soma_man_m += res_dia["man_m"]
 
-            etapas_concluidas += 1
+            unidades_concluidas += 1
+            _emitir_progresso(contrato["nome"], d_iso)
 
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:AJ{max(1, ws.max_row)}"
@@ -793,9 +894,17 @@ def gerar_excel_indicadores(
         })
         total_linhas_geral += linhas_aba
 
+    if wb.worksheets:
+        wb.active = 0
+        for idx, sheet in enumerate(wb.worksheets):
+            if sheet.views and sheet.views.sheetView:
+                sheet.views.sheetView[0].tabSelected = (idx == 0)
+
     buf = io.BytesIO()
     wb.save(buf)
     xlsx_bytes = buf.getvalue()
+    if not xlsx_bytes.startswith(b"PK\x03\x04"):
+        raise RuntimeError("Falha ao gerar arquivo Excel válido (assinatura ZIP ausente).")
     filename = f"Indicadores - Mapa de Execucao - {periodo['rotulo_arquivo']}.xlsx"
 
     if progress_cb:
@@ -806,6 +915,7 @@ def gerar_excel_indicadores(
             "etapas_total": etapas_total,
             "progresso_pct": 100.0,
             "resumo_cidades": list(resumo_cidades),
+            "avisos": list(avisos),
         })
 
     return {
@@ -823,6 +933,7 @@ def gerar_excel_indicadores(
         "total_abas": len(contratos),
         "total_linhas": total_linhas_geral,
         "resumo_cidades": resumo_cidades,
+        "avisos": avisos,
     }
 
 
@@ -868,6 +979,7 @@ def iniciar_job_indicadores(
             "mes_em_andamento": periodo["mes_em_andamento"],
         },
         "resumo_cidades": [],
+        "avisos": [],
         "filename": None,
         "tamanho_kb": 0.0,
         "total_abas": len(contratos),
@@ -893,6 +1005,8 @@ def iniciar_job_indicadores(
             job["progresso_pct"] = upd.get("progresso_pct", job["progresso_pct"])
             if "resumo_cidades" in upd:
                 job["resumo_cidades"] = upd["resumo_cidades"]
+            if "avisos" in upd:
+                job["avisos"] = upd["avisos"]
 
     def _worker() -> None:
         try:
@@ -915,6 +1029,7 @@ def iniciar_job_indicadores(
                     job["total_linhas"] = resultado["total_linhas"]
                     job["gerado_em"] = resultado["gerado_em"]
                     job["resumo_cidades"] = resultado["resumo_cidades"]
+                    job["avisos"] = resultado.get("avisos", [])
                     job["_xlsx_bytes"] = resultado["xlsx_bytes"]
         except Exception as e:
             print(f"[INDICADORES] Erro no job {job_id}: {e}")

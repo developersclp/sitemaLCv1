@@ -85,6 +85,12 @@ class HeatmapEngine:
         rd_items: List[Dict[str, Any]] = []
         st_items: List[Dict[str, Any]] = []
 
+        hoje_iso = datetime.now().strftime("%Y-%m-%d")
+        usar_setores_cache_local = (str(data_iso)[:10] < hoje_iso) and (not force_refresh)
+        cid_st = (contrato_id or "").lower().strip() or None
+        if cid_st in ("todas", "all"):
+            cid_st = None
+
         with ThreadPoolExecutor(max_workers=3) as pool:
             f_rt = pool.submit(
                 self.inlog.get_veiculos_tempo_real,
@@ -98,11 +104,14 @@ class HeatmapEngine:
                 contrato_id=contrato_id,
                 force_refresh=force_refresh,
             )
-            f_st = pool.submit(
-                self.inlog.get_setores_tempo_real,
-                contrato_id=contrato_id,
-                force_refresh=force_refresh,
-            )
+            if usar_setores_cache_local:
+                f_st = pool.submit(self.inlog._ler_setores_tempo_real_db, cid_st)
+            else:
+                f_st = pool.submit(
+                    self.inlog.get_setores_tempo_real,
+                    contrato_id=contrato_id,
+                    force_refresh=force_refresh,
+                )
             try:
                 veiculos_rt = f_rt.result() or []
             except Exception as e:
@@ -355,6 +364,7 @@ class HeatmapEngine:
         forcar_reprocessamento: bool = False,
         operacao: str = "COLETA",
         _retry_malha: int = 0,
+        incluir_geojson: bool = True,
     ) -> Dict[str, Any]:
         """Executa a auditoria espacial real da cidade na data informada ou recupera do SQLite."""
         contrato_id = contrato_id.lower().strip()
@@ -433,7 +443,7 @@ class HeatmapEngine:
             )
             audit_existente = cur.fetchone()
             if audit_existente:
-                criado_em_str = str(audit_existente["criado_em"] or "")
+                criado_em_str = str(audit_existente["criado_em"] or "").strip().replace(" ", "T")[:19]
                 try:
                     placas_salvas = json.loads(audit_existente["placas_ativas_json"] or "[]")
                     if not isinstance(placas_salvas, list):
@@ -441,26 +451,43 @@ class HeatmapEngine:
                 except Exception:
                     placas_salvas = []
 
+                placas_simuladas = {"LOC-1010", "LOC-2020"}
+                somente_placas_simuladas = (
+                    self.inlog.is_configured()
+                    and bool(placas_salvas)
+                    and all(str(p).upper().strip() in placas_simuladas for p in placas_salvas)
+                )
+                sem_placas_reais = (len(placas_salvas) == 0) or somente_placas_simuladas
                 auditoria_vazia = (
                     float(audit_existente["pct_cobertura"] or 0.0) <= 0.0
-                    and len(placas_salvas) == 0
+                    and sem_placas_reais
                     and data_iso <= datetime.now().strftime("%Y-%m-%d")
                 )
                 idade_cache_seg = 999999.0
-                if len(criado_em_str) >= 19 and "T" in criado_em_str:
+                criado_em_valido = len(criado_em_str) == 19 and criado_em_str[10] == "T"
+                if criado_em_valido:
                     try:
-                        dt_c = datetime.strptime(criado_em_str[:19], "%Y-%m-%dT%H:%M:%S")
+                        dt_c = datetime.strptime(criado_em_str, "%Y-%m-%dT%H:%M:%S")
                         idade_cache_seg = (datetime.now() - dt_c).total_seconds()
                     except Exception:
-                        pass
+                        criado_em_valido = False
 
                 cache_obsoleto = (
-                    len(criado_em_str) < 19
-                    or "T" not in criado_em_str
+                    not criado_em_valido
                     or (criado_em_str < win_op["data_fim"] and agora_local_str > criado_em_str)
                     or (auditoria_vazia and idade_cache_seg >= 60.0)
                 )
                 if not cache_obsoleto:
+                    if not incluir_geojson:
+                        conn.close()
+                        return {
+                            "resumo": {
+                                "id": int(audit_existente["id"]),
+                                "contrato_id": contrato_id,
+                                "data_iso": data_iso,
+                                "pct_cobertura": float(audit_existente["pct_cobertura"] or 0.0),
+                            }
+                        }
                     res = self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
                     conn.close()
                     return res
@@ -680,7 +707,19 @@ class HeatmapEngine:
                 forcar_reprocessamento=False,
                 operacao=operacao_norm,
                 _retry_malha=_retry_malha + 1,
+                incluir_geojson=incluir_geojson,
             )
+
+        if not incluir_geojson:
+            conn.close()
+            return {
+                "resumo": {
+                    "id": int(audit_id),
+                    "contrato_id": contrato_id,
+                    "data_iso": data_iso,
+                    "pct_cobertura": round(pct_cobertura, 2),
+                }
+            }
 
         cur.execute("SELECT * FROM auditorias WHERE id = ?", (audit_id,))
         audit_row = dict(cur.fetchone())

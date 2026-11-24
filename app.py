@@ -307,7 +307,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             text-transform: uppercase;
             white-space: nowrap;
         }
-        select, input[type="date"], input[type="text"] {
+        select, input[type="date"], input[type="month"], input[type="text"] {
             border: 1px solid var(--gray-border);
             border-radius: 5px;
             padding: 2px 6px;
@@ -319,7 +319,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             height: 27px;
             transition: border-color 0.15s;
         }
-        .toolbar select, .toolbar input[type="date"], .toolbar input[type="text"] {
+        .toolbar select, .toolbar input[type="date"], .toolbar input[type="month"], .toolbar input[type="text"] {
             max-width: 175px;
         }
         select:focus, input:focus { border-color: var(--locar-green); }
@@ -1124,7 +1124,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 font-weight: 700;
                 color: var(--text-dark);
             }
-            .sidebar-field select, .sidebar-field input[type="text"], .sidebar-field input[type="date"] {
+            .sidebar-field select, .sidebar-field input[type="text"], .sidebar-field input[type="date"], .sidebar-field input[type="month"] {
                 width: 100% !important;
                 max-width: 100% !important;
                 height: 34px;
@@ -3694,7 +3694,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let indModoAtual = 'dia';
         let indJobIdAtual = null;
         let indPollTimer = null;
+        let indPollRunId = 0;
         let indDownloadUrlAtual = null;
+        let indFilenameAtual = null;
 
         function popularCidadesIndicadores() {
             const grid = document.getElementById('indCidadesGrid');
@@ -3720,7 +3722,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 const d = document.getElementById('indInputData')?.value || hojeIso;
                 if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
                     const [a, m, dia] = d.split('-');
-                    el.innerText = `${dia}/${m}/${a} (1 dia)`;
+                    el.innerText = d > hojeIso
+                        ? `${dia}/${m}/${a} (data futura sem operação)`
+                        : `${dia}/${m}/${a} (1 dia)`;
                 } else {
                     el.innerText = 'Selecione uma data válida';
                 }
@@ -3774,6 +3778,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 inpMes.max = hojeIso.slice(0, 7);
                 inpMes.value = (dataToolbar <= hojeIso ? dataToolbar : hojeIso).slice(0, 7);
             }
+            const progBox = document.getElementById('indProgressBox');
+            const progLbl = document.getElementById('indProgressLabel');
+            const progSub = document.getElementById('indProgressSub');
+            const progBar = document.getElementById('indProgressBar');
+            const progPct = document.getElementById('indProgressPct');
+            const resumoWrap = document.getElementById('indResumoWrap');
+            const btnAgain = document.getElementById('btnIndBaixarNovamente');
+            if (!indPollTimer && !indDownloadUrlAtual) {
+                if (progBox) progBox.style.display = 'none';
+                if (resumoWrap) resumoWrap.style.display = 'none';
+                if (btnAgain) btnAgain.style.display = 'none';
+                if (progBar) progBar.style.width = '0%';
+                if (progPct) progPct.innerText = '0%';
+                if (progLbl) progLbl.innerText = 'Preparando extração...';
+                if (progSub) progSub.innerText = 'Aguarde enquanto os indicadores de todas as cidades são consolidados...';
+            }
             setModoIndicadores(indModoAtual);
             modal.style.display = 'flex';
         }
@@ -3806,6 +3826,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }).join('');
         }
 
+        async function baixarArquivoIndicadores(url, filename) {
+            if (!url) return false;
+            const progLbl = document.getElementById('indProgressLabel');
+            const progSub = document.getElementById('indProgressSub');
+            try {
+                const resp = await fetch(url, { credentials: 'same-origin' });
+                if (!resp.ok) {
+                    let msgErro = `Falha ao baixar arquivo (HTTP ${resp.status}).`;
+                    try {
+                        const ct = resp.headers.get('Content-Type') || '';
+                        if (ct.includes('application/json')) {
+                            const errJson = await resp.json();
+                            if (errJson && errJson.erro) msgErro = errJson.erro;
+                        } else {
+                            const txt = await resp.text();
+                            if (txt) msgErro = txt.slice(0, 200);
+                        }
+                    } catch (_) {}
+                    throw new Error(msgErro);
+                }
+                const blob = await resp.blob();
+                if (!blob || blob.size === 0) {
+                    throw new Error('O arquivo Excel retornado veio vazio.');
+                }
+                const nomeFinal = filename || 'Indicadores_Mapa_Execucao.xlsx';
+                const blobUrl = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = blobUrl;
+                link.download = nomeFinal;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                setTimeout(() => URL.revokeObjectURL(blobUrl), 2500);
+                return true;
+            } catch (errDl) {
+                if (progLbl) progLbl.innerText = '❌ Erro ao baixar arquivo Excel';
+                if (progSub) progSub.innerText = errDl.message || 'Falha durante o download.';
+                mostrarToast(errDl.message || 'Erro ao baixar Excel.');
+                return false;
+            }
+        }
+
         async function iniciarGeracaoIndicadores() {
             const btn = document.getElementById('btnGerarExcelIndicadores');
             const btnAgain = document.getElementById('btnIndBaixarNovamente');
@@ -3815,6 +3878,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const progLbl = document.getElementById('indProgressLabel');
             const progSub = document.getElementById('indProgressSub');
 
+            const hojeIso = formatDataHojeISO();
+            const dataVal = document.getElementById('indInputData')?.value || '';
+            const mesVal = document.getElementById('indInputMes')?.value || '';
+
+            if (indModoAtual === 'dia') {
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(dataVal)) {
+                    mostrarToast('Selecione uma data válida para exportar.');
+                    return;
+                }
+                if (dataVal > hojeIso) {
+                    mostrarToast('A data selecionada é futura e ainda não possui operação.');
+                    return;
+                }
+            } else {
+                if (!/^\d{4}-\d{2}$/.test(mesVal)) {
+                    mostrarToast('Selecione um mês/ano válido para exportar.');
+                    return;
+                }
+                if (`${mesVal}-01` > hojeIso) {
+                    mostrarToast('O mês selecionado ainda não iniciou.');
+                    return;
+                }
+            }
+
             const cidadesSel = Array.from(document.querySelectorAll('#indCidadesGrid .ind-city-chk:checked')).map(c => c.value);
             if (cidadesSel.length === 0) {
                 mostrarToast('Selecione ao menos uma cidade para gerar o relatório.');
@@ -3823,13 +3910,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
             const payload = {
                 modo: indModoAtual,
-                data: document.getElementById('indInputData')?.value || formatDataHojeISO(),
-                mes: document.getElementById('indInputMes')?.value || formatDataHojeISO().slice(0, 7),
+                data: dataVal || hojeIso,
+                mes: mesVal || hojeIso.slice(0, 7),
                 cidades: cidadesSel
             };
 
-            clearInterval(indPollTimer);
+            clearTimeout(indPollTimer);
+            indPollTimer = null;
+            indPollRunId += 1;
+            const runId = indPollRunId;
+            let baixou = false;
+
             indDownloadUrlAtual = null;
+            indFilenameAtual = null;
             if (btn) { btn.disabled = true; btn.innerText = '⏳ Gerando Excel...'; }
             if (btnAgain) btnAgain.style.display = 'none';
             if (progBox) progBox.style.display = 'block';
@@ -3842,21 +3935,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
             try {
                 const resp = await fetch('/api/indicadores/gerar', {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
                 const res = await resp.json();
-                if (!res || !res.sucesso || !res.job_id) {
+                if (!resp.ok || !res || !res.sucesso || !res.job_id) {
                     throw new Error((res && res.erro) || 'Falha ao iniciar geração dos indicadores.');
                 }
+                if (runId !== indPollRunId) return;
                 indJobIdAtual = res.job_id;
 
                 const checarStatus = async () => {
+                    if (runId !== indPollRunId) return;
                     try {
-                        const rSt = await fetch(`/api/indicadores/status?job_id=${encodeURIComponent(indJobIdAtual)}&_t=${Date.now()}`);
+                        const rSt = await fetch(`/api/indicadores/status?job_id=${encodeURIComponent(indJobIdAtual)}&_t=${Date.now()}`, {
+                            credentials: 'same-origin'
+                        });
                         const st = await rSt.json();
-                        if (!st || !st.sucesso) {
-                            clearInterval(indPollTimer);
+                        if (runId !== indPollRunId) return;
+                        if (!rSt.ok || !st || !st.sucesso) {
                             throw new Error((st && st.erro) || 'Job de indicadores não encontrado.');
                         }
                         const pct = Math.max(0, Math.min(100, Number(st.progresso_pct || 0)));
@@ -3868,8 +3966,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                                 : `Processando ${st.cidade_atual || ''} · ${st.data_atual || ''}`;
                         }
                         if (progSub) {
+                            const avisosTxt = (st.avisos && st.avisos.length > 0) ? ` · ${st.avisos.length} aviso(s)` : '';
                             progSub.innerText = st.status === 'done'
-                                ? `${st.total_abas || 0} abas · ${Number(st.total_linhas || 0).toLocaleString('pt-BR')} linhas · ${st.tamanho_kb || 0} KB · Gerado em ${st.gerado_em || ''}`
+                                ? `${st.total_abas || 0} abas · ${Number(st.total_linhas || 0).toLocaleString('pt-BR')} linhas · ${st.tamanho_kb || 0} KB · Gerado em ${st.gerado_em || ''}${avisosTxt}`
                                 : `Etapa ${st.etapas_concluidas || 0} de ${st.etapas_total || 0} (reaproveitando cache quando disponível)...`;
                         }
                         if (st.resumo_cidades && st.resumo_cidades.length > 0) {
@@ -3880,23 +3979,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         }
 
                         if (st.status === 'done') {
-                            clearInterval(indPollTimer);
+                            clearTimeout(indPollTimer);
+                            indPollTimer = null;
                             indDownloadUrlAtual = st.download_url;
+                            indFilenameAtual = st.filename || 'Indicadores_Mapa_Execucao.xlsx';
                             if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
                             if (btnAgain) btnAgain.style.display = 'inline-flex';
-                            mostrarToast('Excel de Indicadores gerado! Iniciando download...');
-                            if (indDownloadUrlAtual) {
-                                window.location.href = indDownloadUrlAtual;
+                            if (!baixou && indDownloadUrlAtual) {
+                                baixou = true;
+                                mostrarToast('Excel de Indicadores gerado! Iniciando download...');
+                                await baixarArquivoIndicadores(indDownloadUrlAtual, indFilenameAtual);
                             }
                         } else if (st.status === 'error') {
-                            clearInterval(indPollTimer);
+                            clearTimeout(indPollTimer);
+                            indPollTimer = null;
                             if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
                             if (progLbl) progLbl.innerText = '❌ Erro na geração do relatório';
                             if (progSub) progSub.innerText = st.erro || 'Erro inesperado.';
                             mostrarToast('Erro ao gerar indicadores: ' + (st.erro || 'Falha'));
+                        } else if (st.status === 'running' && runId === indPollRunId) {
+                            indPollTimer = setTimeout(checarStatus, 750);
                         }
                     } catch (errPoll) {
-                        clearInterval(indPollTimer);
+                        clearTimeout(indPollTimer);
+                        indPollTimer = null;
                         if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
                         if (progLbl) progLbl.innerText = '❌ Erro de comunicação';
                         if (progSub) progSub.innerText = errPoll.message || 'Falha ao consultar progresso.';
@@ -3904,8 +4010,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 };
 
                 await checarStatus();
-                indPollTimer = setInterval(checarStatus, 750);
             } catch (err) {
+                clearTimeout(indPollTimer);
+                indPollTimer = null;
                 if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
                 if (progLbl) progLbl.innerText = '❌ Não foi possível iniciar a extração';
                 if (progSub) progSub.innerText = err.message || 'Erro desconhecido.';
@@ -4236,7 +4343,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
         document.getElementById('btnGerarExcelIndicadores')?.addEventListener('click', iniciarGeracaoIndicadores);
         document.getElementById('btnIndBaixarNovamente')?.addEventListener('click', () => {
-            if (indDownloadUrlAtual) window.location.href = indDownloadUrlAtual;
+            if (indDownloadUrlAtual) baixarArquivoIndicadores(indDownloadUrlAtual, indFilenameAtual);
         });
 
         document.getElementById('btnShareLink').addEventListener('click', abrirModalShare);
@@ -4682,9 +4789,12 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"sucesso": False, "erro": "Arquivo Excel não encontrado ou ainda em geração."}, status=404)
                 return
             xlsx_bytes, filename = arq
+            safe_ascii = filename.replace('"', "")
+            quoted_utf8 = urllib.parse.quote(filename)
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{quoted_utf8}')
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.send_header("Content-Length", str(len(xlsx_bytes)))
             self.end_headers()

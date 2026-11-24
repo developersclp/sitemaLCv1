@@ -658,6 +658,18 @@ class InlogService:
                 if sucesso and isinstance(dados, list):
                     self._persistir_setores_tempo_real(dados)
                     self._mark_recent_fetch("setores_rt")
+                else:
+                    conn_chk = db.get_connection()
+                    try:
+                        row_chk = conn_chk.execute(
+                            "SELECT COUNT(*) AS qtd FROM inlog_setores_tempo_real"
+                        ).fetchone()
+                        if row_chk and row_chk["qtd"] > 0:
+                            self._mark_recent_fetch("setores_rt")
+                    except Exception:
+                        pass
+                    finally:
+                        conn_chk.close()
 
         return self._ler_setores_tempo_real_db(cid_norm)
 
