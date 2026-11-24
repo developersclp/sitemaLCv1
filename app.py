@@ -3986,7 +3986,7 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             token_ou_id = urllib.parse.unquote(path[3:].strip("/"))
             sec_headers = {
                 "X-Robots-Tag": "noindex, nofollow",
-                "Referrer-Policy": "no-referrer",
+                "Referrer-Policy": "strict-origin-when-cross-origin",
                 "X-Content-Type-Options": "nosniff",
             }
             secure_attr = "; Secure" if self._is_https_request() else ""

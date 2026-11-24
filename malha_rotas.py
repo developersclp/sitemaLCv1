@@ -1094,74 +1094,75 @@ def _gravar_projeto(
                 and (e.get("is_manual") or (e.get("tipo") or "COLETA") != "COLETA" or e.get("atualizado_em"))
             ]
 
-            with conn:
-                # 3. Backup integral (sem perda) dos segmentos anteriores que não vieram da malha
-                legado = [e for e in existentes if (e.get("origem") or "") != "MALHA_GPKG"]
-                if legado:
+            with db._write_lock:
+                with conn:
+                    # 3. Backup integral (sem perda) dos segmentos anteriores que não vieram da malha
+                    legado = [e for e in existentes if (e.get("origem") or "") != "MALHA_GPKG"]
+                    if legado:
+                        cur.executemany(
+                            """
+                            INSERT INTO segmentos_viarios_legado
+                                (id_original, contrato_id, fid, nome_rua, setor, extensao_m, geom_json,
+                                 tipo, is_manual, is_priority, atualizado_em)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                (e["id"], e["contrato_id"], e.get("fid"), e.get("nome_rua"), e.get("setor"),
+                                 e.get("extensao_m"), e["geom_json"], e.get("tipo"), e.get("is_manual"),
+                                 e.get("is_priority"), e.get("atualizado_em"))
+                                for e in legado
+                            ],
+                        )
+                    cur.execute("DELETE FROM auditorias WHERE contrato_id = ?", (contrato_id,))
+                    if preservar_ids:
+                        ph = ",".join("?" * len(preservar_ids))
+                        cur.execute(
+                            f"UPDATE segmentos_viarios SET origem = 'EDICAO_USUARIO' WHERE id IN ({ph})",
+                            preservar_ids,
+                        )
+                        cur.execute(
+                            f"DELETE FROM segmentos_viarios WHERE contrato_id = ? AND id NOT IN ({ph})",
+                            [contrato_id] + preservar_ids,
+                        )
+                    else:
+                        cur.execute("DELETE FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,))
+
                     cur.executemany(
                         """
-                        INSERT INTO segmentos_viarios_legado
-                            (id_original, contrato_id, fid, nome_rua, setor, extensao_m, geom_json,
-                             tipo, is_manual, is_priority, atualizado_em)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO segmentos_viarios
+                            (contrato_id, fid, nome_rua, setor, extensao_m, geom_json, tipo, is_manual,
+                             is_priority, atualizado_em, edge_key, setores_json, origem, bairro)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'MALHA_GPKG', ?)
                         """,
                         [
-                            (e["id"], e["contrato_id"], e.get("fid"), e.get("nome_rua"), e.get("setor"),
-                             e.get("extensao_m"), e["geom_json"], e.get("tipo"), e.get("is_manual"),
-                             e.get("is_priority"), e.get("atualizado_em"))
-                            for e in legado
+                            (contrato_id, r["fid"], r["nome_rua"], r["setor"], r["extensao_m"],
+                             json.dumps(r["coords"]), r["tipo"], r["is_manual"], r["is_priority"],
+                             r["edge_key"], json.dumps(r["setores"], ensure_ascii=False), r["bairro"])
+                            for r in registros
                         ],
                     )
-                cur.execute("DELETE FROM auditorias WHERE contrato_id = ?", (contrato_id,))
-                if preservar_ids:
-                    ph = ",".join("?" * len(preservar_ids))
+                    km_total = round(sum(r["extensao_m"] for r in registros) / 1000.0, 2)
                     cur.execute(
-                        f"UPDATE segmentos_viarios SET origem = 'EDICAO_USUARIO' WHERE id IN ({ph})",
-                        preservar_ids,
+                        """
+                        INSERT INTO projetos_malha
+                            (contrato_id, malha_arquivo, malha_mtime, rotas_dir, rotas_mtime, n_rotas,
+                             n_segmentos, km_total, n_prioritarias, n_preservados, construido_em)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT (contrato_id) DO UPDATE SET
+                            malha_arquivo = excluded.malha_arquivo,
+                            malha_mtime = excluded.malha_mtime,
+                            rotas_dir = excluded.rotas_dir,
+                            rotas_mtime = excluded.rotas_mtime,
+                            n_rotas = excluded.n_rotas,
+                            n_segmentos = excluded.n_segmentos,
+                            km_total = excluded.km_total,
+                            n_prioritarias = excluded.n_prioritarias,
+                            n_preservados = excluded.n_preservados,
+                            construido_em = CURRENT_TIMESTAMP
+                        """,
+                        (contrato_id, malha_path, malha_mtime, dir_rotas(), rotas_mtime, n_rotas,
+                         len(registros), km_total, sum(r["is_priority"] for r in registros), len(preservar_ids)),
                     )
-                    cur.execute(
-                        f"DELETE FROM segmentos_viarios WHERE contrato_id = ? AND id NOT IN ({ph})",
-                        [contrato_id] + preservar_ids,
-                    )
-                else:
-                    cur.execute("DELETE FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,))
-
-                cur.executemany(
-                    """
-                    INSERT INTO segmentos_viarios
-                        (contrato_id, fid, nome_rua, setor, extensao_m, geom_json, tipo, is_manual,
-                         is_priority, atualizado_em, edge_key, setores_json, origem, bairro)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'MALHA_GPKG', ?)
-                    """,
-                    [
-                        (contrato_id, r["fid"], r["nome_rua"], r["setor"], r["extensao_m"],
-                         json.dumps(r["coords"]), r["tipo"], r["is_manual"], r["is_priority"],
-                         r["edge_key"], json.dumps(r["setores"], ensure_ascii=False), r["bairro"])
-                        for r in registros
-                    ],
-                )
-                km_total = round(sum(r["extensao_m"] for r in registros) / 1000.0, 2)
-                cur.execute(
-                    """
-                    INSERT INTO projetos_malha
-                        (contrato_id, malha_arquivo, malha_mtime, rotas_dir, rotas_mtime, n_rotas,
-                         n_segmentos, km_total, n_prioritarias, n_preservados, construido_em)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (contrato_id) DO UPDATE SET
-                        malha_arquivo = excluded.malha_arquivo,
-                        malha_mtime = excluded.malha_mtime,
-                        rotas_dir = excluded.rotas_dir,
-                        rotas_mtime = excluded.rotas_mtime,
-                        n_rotas = excluded.n_rotas,
-                        n_segmentos = excluded.n_segmentos,
-                        km_total = excluded.km_total,
-                        n_prioritarias = excluded.n_prioritarias,
-                        n_preservados = excluded.n_preservados,
-                        construido_em = CURRENT_TIMESTAMP
-                    """,
-                    (contrato_id, malha_path, malha_mtime, dir_rotas(), rotas_mtime, n_rotas,
-                     len(registros), km_total, sum(r["is_priority"] for r in registros), len(preservar_ids)),
-                )
             return {
                 "ok": True,
                 "reconstruido": True,

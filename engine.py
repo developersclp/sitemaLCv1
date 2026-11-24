@@ -354,6 +354,7 @@ class HeatmapEngine:
         turno: str = "DIURNO",
         forcar_reprocessamento: bool = False,
         operacao: str = "COLETA",
+        _retry_malha: int = 0,
     ) -> Dict[str, Any]:
         """Executa a auditoria espacial real da cidade na data informada ou recupera do SQLite."""
         contrato_id = contrato_id.lower().strip()
@@ -622,43 +623,64 @@ class HeatmapEngine:
         km_omissao = round(nao_coletado_m / 1000.0, 2)
         vias_omissao = sum(1 for d in detalhes_inserir if d[1] == "not_collected")
 
-        # 6. Grava auditoria determinística no SQLite com transação atômica
+        # 6. Grava auditoria determinística no banco com transação atômica
+        #    Verifica se a malha da cidade não foi reconstruída em paralelo durante a coleta GPS.
+        malha_alterada = False
         with db._write_lock:
-            with conn:
-                cur.execute(
-                    "DELETE FROM auditorias WHERE contrato_id = ? AND data_iso = ? AND turno = ?",
-                    (contrato_id, data_iso, turno_chave),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO auditorias (
-                        contrato_id, data_iso, turno, pct_cobertura, km_total, km_coletado,
-                        km_omissao, total_vias, vias_omissao, placas_ativas_json, criado_em
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        contrato_id,
-                        data_iso,
-                        turno_chave,
-                        round(pct_cobertura, 2),
-                        km_total,
-                        km_coletado,
-                        km_omissao,
-                        len(segmentos),
-                        vias_omissao,
-                        json.dumps(placas),
-                        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                    ),
-                )
-                audit_id = cur.lastrowid
-                detalhes_com_id = [(audit_id, seg_id, st, p_resp) for seg_id, st, p_resp in detalhes_inserir]
-                cur.executemany(
-                    """
-                    INSERT INTO auditoria_detalhes (auditoria_id, segmento_id, status, placas_responsaveis)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    detalhes_com_id,
-                )
+            cur.execute("SELECT id FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,))
+            ids_validos = {int(r["id"]) for r in cur.fetchall()}
+            detalhes_validos = [(seg_id, st, p_resp) for seg_id, st, p_resp in detalhes_inserir if int(seg_id) in ids_validos]
+
+            if detalhes_inserir and len(detalhes_validos) < len(detalhes_inserir) and _retry_malha < 1:
+                malha_alterada = True
+            else:
+                with conn:
+                    cur.execute(
+                        "DELETE FROM auditorias WHERE contrato_id = ? AND data_iso = ? AND turno = ?",
+                        (contrato_id, data_iso, turno_chave),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO auditorias (
+                            contrato_id, data_iso, turno, pct_cobertura, km_total, km_coletado,
+                            km_omissao, total_vias, vias_omissao, placas_ativas_json, criado_em
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            contrato_id,
+                            data_iso,
+                            turno_chave,
+                            round(pct_cobertura, 2),
+                            km_total,
+                            km_coletado,
+                            km_omissao,
+                            len(detalhes_validos),
+                            sum(1 for d in detalhes_validos if d[1] == "not_collected"),
+                            json.dumps(placas),
+                            datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                        ),
+                    )
+                    audit_id = cur.lastrowid
+                    detalhes_com_id = [(audit_id, seg_id, st, p_resp) for seg_id, st, p_resp in detalhes_validos]
+                    if detalhes_com_id:
+                        cur.executemany(
+                            """
+                            INSERT INTO auditoria_detalhes (auditoria_id, segmento_id, status, placas_responsaveis)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            detalhes_com_id,
+                        )
+
+        if malha_alterada:
+            conn.close()
+            return self.processar_ou_obter_auditoria(
+                contrato_id=contrato_id,
+                data_iso=data_iso,
+                turno=turno,
+                forcar_reprocessamento=False,
+                operacao=operacao_norm,
+                _retry_malha=_retry_malha + 1,
+            )
 
         cur.execute("SELECT * FROM auditorias WHERE id = ?", (audit_id,))
         audit_row = dict(cur.fetchone())
