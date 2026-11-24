@@ -1628,6 +1628,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let setoresList = [];
         let setorTurnoMap = {};
         let selectedSectors = new Set();
+        let allSectorsSelected = true;
         let lastCenteredCity = null;
         let isSharedLinkMode = false;
         let sharedToken = null;
@@ -1759,18 +1760,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 if (fc) fc.value = lockCfg.coleta;
             }
             if (lockCfg && Array.isArray(lockCfg.setores) && lockCfg.setores.length > 0) {
+                allSectorsSelected = false;
                 selectedSectors = new Set(lockCfg.setores);
+            } else {
+                allSectorsSelected = true;
+                selectedSectors.clear();
             }
 
-            // Bloqueia controles de alteração de exibição para quem acessa o link
-            ['selectCidade', 'inputData', 'selectTurno', 'selectOperacao', 'filterTurno', 'filterColeta', 'filterVeiculo'].forEach(id => {
+            // Bloqueia apenas controles de consulta ao servidor (cidade e data fixas do link)
+            ['selectCidade', 'inputData', 'selectTurno', 'selectOperacao'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.disabled = true;
             });
+            // Mantém os filtros locais de visualização (Turno, Coleta, Veículo e Setores) 100% interativos
             const msList = document.getElementById('multiSetorList');
             if (msList) {
-                msList.style.pointerEvents = 'none';
-                msList.style.opacity = '0.7';
+                msList.style.pointerEvents = 'auto';
+                msList.style.opacity = '1';
             }
         }
 
@@ -1822,7 +1828,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }
             if (urlParams.has('setores')) {
                 const parts = urlParams.get('setores').split(',').map(s => s.trim()).filter(Boolean);
-                selectedSectors = new Set(parts);
+                if (parts.length > 0) {
+                    allSectorsSelected = false;
+                    selectedSectors = new Set(parts);
+                } else {
+                    allSectorsSelected = true;
+                    selectedSectors.clear();
+                }
             }
         }
 
@@ -1917,7 +1929,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 }
 
                 if (lastCenteredCity !== cidade) {
-                    if (!isSharedLinkMode) selectedSectors.clear();
+                    if (!isSharedLinkMode) {
+                        selectedSectors.clear();
+                        allSectorsSelected = true;
+                    }
                     const c = dataRes.resumo.centro || [-8.1930, -34.9364];
                     const z = dataRes.resumo.zoom || 12;
                     map.setView(c, z, { animate: true });
@@ -2283,15 +2298,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
             return setoresList.filter(s => obterTurnoSetor(s.codigo) === turno);
         }
 
+        function normalizarCodigoSetor(cod) {
+            return String(cod || '').trim().toUpperCase();
+        }
+
         function renderizarListaSetoresFiltro() {
             const multiSetorList = document.getElementById('multiSetorList');
             if (!multiSetorList) return;
             const visiveis = getSetoresDoTurnoAtual();
+            const normSelected = new Set(Array.from(selectedSectors).map(normalizarCodigoSetor));
             multiSetorList.innerHTML = '';
             visiveis.forEach(s => {
-                const isChecked = (selectedSectors.size === 0 || selectedSectors.has(s.codigo));
+                const codNorm = normalizarCodigoSetor(s.codigo);
+                const isChecked = allSectorsSelected || normSelected.has(codNorm);
                 const item = document.createElement('label');
-                item.className = 'multi-select-item' + (isChecked && selectedSectors.size > 0 && selectedSectors.size < visiveis.length ? ' selected' : '');
+                item.className = 'multi-select-item' + (isChecked && !allSectorsSelected ? ' selected' : '');
                 item.dataset.code = String(s.codigo || '').toLowerCase();
                 item.innerHTML = `
                     <input type="checkbox" value="${escapeHtml(s.codigo)}" ${isChecked ? 'checked' : ''} />
@@ -2299,8 +2320,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         <span class="sector-code">${escapeHtml(s.codigo)}</span>
                         <span class="sector-meta">${s.agenda_rotulo ? escapeHtml(s.agenda_rotulo) + ' · ' : ''}${s.total_vias || 0} vias · ${s.extensao_km || 0} km</span>
                     </div>
+                    <button type="button" class="btn-chip btn-solo-sector" title="Filtrar apenas este setor" style="font-size:0.65rem; padding:1px 6px; margin-left:6px; flex-shrink:0;">Só este</button>
                 `;
                 item.querySelector('input').addEventListener('change', () => onSectorCheckboxChange());
+                const btnSolo = item.querySelector('.btn-solo-sector');
+                if (btnSolo) {
+                    btnSolo.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        selecionarApenasSetor(s.codigo);
+                    });
+                }
                 multiSetorList.appendChild(item);
             });
             atualizarTriggerSetores();
@@ -2330,15 +2360,33 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         function onSectorCheckboxChange() {
             const checkboxes = document.querySelectorAll('#multiSetorList input[type="checkbox"]');
+            const total = checkboxes.length;
             const marcados = [];
             checkboxes.forEach(c => {
                 if (c.checked) marcados.push(c.value);
-                const parent = c.closest('.multi-select-item');
-                if (parent) parent.classList.toggle('selected', c.checked && marcados.length < checkboxes.length);
             });
-            if (marcados.length === 0 || marcados.length === checkboxes.length) selectedSectors.clear();
-            else selectedSectors = new Set(marcados);
+            if (total > 0 && marcados.length === total) {
+                allSectorsSelected = true;
+                selectedSectors.clear();
+            } else if (marcados.length === 0) {
+                allSectorsSelected = false;
+                selectedSectors.clear();
+            } else {
+                allSectorsSelected = false;
+                selectedSectors = new Set(marcados);
+            }
+            checkboxes.forEach(c => {
+                const parent = c.closest('.multi-select-item');
+                if (parent) parent.classList.toggle('selected', c.checked && !allSectorsSelected);
+            });
             atualizarTriggerSetores();
+            aplicarFiltros();
+        }
+
+        function selecionarApenasSetor(codigo) {
+            allSectorsSelected = false;
+            selectedSectors = new Set([codigo]);
+            sincronizarCheckboxesSetor();
             aplicarFiltros();
         }
 
@@ -2348,13 +2396,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const total = getSetoresDoTurnoAtual().length;
             if (!labelEl || !pillEl) return;
 
-            if (selectedSectors.size === 0 || selectedSectors.size >= total) {
+            if (allSectorsSelected || (total > 0 && selectedSectors.size >= total)) {
                 labelEl.innerText = "Todos os setores";
                 pillEl.innerText = `${total} setores`;
                 pillEl.classList.remove('active');
+            } else if (selectedSectors.size === 0) {
+                labelEl.innerText = "Nenhum setor selecionado";
+                pillEl.innerText = `0 de ${total}`;
+                pillEl.classList.add('active');
             } else if (selectedSectors.size === 1) {
                 labelEl.innerText = `Apenas ${Array.from(selectedSectors)[0]}`;
-                pillEl.innerText = "1 setor";
+                pillEl.innerText = `1 de ${total}`;
                 pillEl.classList.add('active');
             } else {
                 labelEl.innerText = `${selectedSectors.size} setores selecionados`;
@@ -2369,6 +2421,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 const parent = c.closest('.multi-select-item');
                 if (parent) parent.classList.remove('selected');
             });
+            allSectorsSelected = true;
             selectedSectors.clear();
             atualizarTriggerSetores();
             aplicarFiltros();
@@ -2377,22 +2430,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
         function clearSectors() {
             const checkboxes = document.querySelectorAll('#multiSetorList input[type="checkbox"]');
             checkboxes.forEach(c => {
-                c.checked = true;
+                c.checked = false;
                 const parent = c.closest('.multi-select-item');
                 if (parent) parent.classList.remove('selected');
             });
+            allSectorsSelected = false;
             selectedSectors.clear();
             atualizarTriggerSetores();
             aplicarFiltros();
         }
 
         function sincronizarCheckboxesSetor() {
-            const total = getSetoresDoTurnoAtual().length;
+            const normSelected = new Set(Array.from(selectedSectors).map(normalizarCodigoSetor));
             document.querySelectorAll('#multiSetorList input[type="checkbox"]').forEach(c => {
-                const shouldCheck = (selectedSectors.size === 0 || selectedSectors.has(c.value));
+                const shouldCheck = allSectorsSelected || normSelected.has(normalizarCodigoSetor(c.value));
                 c.checked = shouldCheck;
                 const parent = c.closest('.multi-select-item');
-                if (parent) parent.classList.toggle('selected', shouldCheck && selectedSectors.size > 0 && selectedSectors.size < total);
+                if (parent) parent.classList.toggle('selected', shouldCheck && !allSectorsSelected);
             });
             atualizarTriggerSetores();
         }
@@ -2412,10 +2466,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         function renderizarRotulosSetores() {
             sectorLabelsLayer.clearLayers();
             if (!showSectorLabels || !setoresList) return;
+            const normSelected = new Set(Array.from(selectedSectors).map(normalizarCodigoSetor));
 
             getSetoresDoTurnoAtual().forEach(s => {
                 if (s.centro && s.centro[0] !== 0) {
-                    const isDestaque = (selectedSectors.size > 0 && selectedSectors.has(s.codigo));
+                    const isDestaque = (!allSectorsSelected && normSelected.has(normalizarCodigoSetor(s.codigo)));
                     const icon = L.divIcon({
                         className: 'sector-custom-marker',
                         html: `<div class="sector-badge-container ${isDestaque ? 'destaque' : ''}">
@@ -2427,8 +2482,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     });
                     const marker = L.marker(s.centro, { icon });
                     marker.on('click', () => {
-                        if (selectedSectors.has(s.codigo) && selectedSectors.size === 1) selectedSectors.clear();
-                        else { selectedSectors.clear(); selectedSectors.add(s.codigo); }
+                        if (!allSectorsSelected && normSelected.has(normalizarCodigoSetor(s.codigo)) && selectedSectors.size === 1) {
+                            allSectorsSelected = true;
+                            selectedSectors.clear();
+                        } else {
+                            allSectorsSelected = false;
+                            selectedSectors = new Set([s.codigo]);
+                        }
                         sincronizarCheckboxesSetor();
                         aplicarFiltros();
                     });
@@ -2466,16 +2526,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 return '#660000';
             }
 
+            const normSelectedSectors = (!allSectorsSelected && selectedSectors.size > 0)
+                ? new Set(Array.from(selectedSectors).map(normalizarCodigoSetor))
+                : null;
+
             currentFeatures.forEach(f => {
-                const p = f.properties;
-                const segSectors = (p.sectors && p.sectors.length) ? p.sectors : [p.sector];
+                const p = f.properties || {};
+                const segSectors = (p.sectors && Array.isArray(p.sectors) && p.sectors.length)
+                    ? p.sectors
+                    : (p.sector ? [p.sector] : []);
                 if (filtroTurno !== 'all') {
                     const atendeTurno = (p.turnos && p.turnos.length)
                         ? p.turnos.includes(filtroTurno)
                         : segSectors.some(s => obterTurnoSetor(s) === filtroTurno);
                     if (!atendeTurno) return;
                 }
-                if (selectedSectors.size > 0 && !segSectors.some(s => selectedSectors.has(s))) return;
+                if (!allSectorsSelected) {
+                    if (!normSelectedSectors || normSelectedSectors.size === 0) return;
+                    if (!segSectors.some(s => normSelectedSectors.has(normalizarCodigoSetor(s)))) return;
+                }
                 if (filtroVeiculo !== 'all' && (!p.vehicles || !p.vehicles.includes(filtroVeiculo))) return;
 
                 const len = p.len_m || 0;
@@ -2655,12 +2724,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 }
             }).addTo(map);
 
-            if (selectedSectors.size === 1) {
-                const sCod = Array.from(selectedSectors)[0];
-                const sInfo = setoresList.find(s => s.codigo === sCod);
+            if (!allSectorsSelected && selectedSectors.size === 1) {
+                const sCod = normalizarCodigoSetor(Array.from(selectedSectors)[0]);
+                const sInfo = setoresList.find(s => normalizarCodigoSetor(s.codigo) === sCod);
                 if (sInfo && sInfo.centro && sInfo.centro[0] !== 0) map.setView(sInfo.centro, 14, { animate: true });
-            } else if (selectedSectors.size > 1) {
-                const pts = setoresList.filter(s => selectedSectors.has(s.codigo) && s.centro && s.centro[0] !== 0).map(s => s.centro);
+            } else if (!allSectorsSelected && selectedSectors.size > 1 && normSelectedSectors) {
+                const pts = setoresList.filter(s => normSelectedSectors.has(normalizarCodigoSetor(s.codigo)) && s.centro && s.centro[0] !== 0).map(s => s.centro);
                 if (pts.length > 0) map.fitBounds(L.latLngBounds(pts), { padding: [40, 40], maxZoom: 15 });
             }
             renderizarRotulosSetores();
@@ -3632,7 +3701,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
             const setoresResumoEl = document.getElementById('modalShareSetoresResumo');
             const totalVis = getSetoresDoTurnoAtual().length;
-            setoresResumoEl.innerText = (selectedSectors.size === 0 || selectedSectors.size >= totalVis)
+            setoresResumoEl.innerText = (allSectorsSelected || selectedSectors.size === 0 || selectedSectors.size >= totalVis)
                 ? 'Todos os setores visíveis na cidade' : Array.from(selectedSectors).join(', ');
             modal.style.display = 'flex';
             gerarUrlShare();
@@ -3662,7 +3731,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }
             const turno = document.getElementById('modalShareTurno')?.value || 'all';
             const coleta = document.getElementById('modalShareColeta').value;
-            const setores = (selectedSectors.size > 0 && selectedSectors.size < setoresList.length)
+            const setores = (!allSectorsSelected && selectedSectors.size > 0 && selectedSectors.size < setoresList.length)
                 ? Array.from(selectedSectors) : [];
             const inp = document.getElementById('inputGeneratedShareUrl');
             const stEl = document.getElementById('shareSnapshotStatus');
@@ -3771,6 +3840,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const ft = document.getElementById('filterTurno');
             if (st && st.value !== novoTurno) st.value = novoTurno;
             if (ft && ft.value !== novoTurno) ft.value = novoTurno;
+            allSectorsSelected = true;
             selectedSectors.clear();
             renderizarListaSetoresFiltro();
             aplicarFiltros();
@@ -3828,6 +3898,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('selectCidade').addEventListener('change', (e) => {
             const cid = e.target.value;
             if (!isSharedLinkMode) {
+                allSectorsSelected = true;
                 selectedSectors.clear();
                 const fv = document.getElementById('filterVeiculo');
                 if (fv) fv.value = 'all';
