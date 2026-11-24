@@ -497,11 +497,16 @@ def setor_visivel_na_data(
     data_iso: str,
     contrato_id: Optional[str] = None,
     turno_forcado: Optional[str] = None,
+    incluir_diario_domingo: bool = True,
 ) -> bool:
     """
     Avalia rigorosamente se o setor deve ser exibido e contabilizado na data consultada,
     seguindo a nomenclatura oficial de sufixos, intervalos, combinações, ordinais mensais,
     quinzenais (QZ) e padrões por prefixo.
+
+    Quando `incluir_diario_domingo=False` (regra oficial do relatório de Indicadores),
+    setores diários padrão (`SCD*` sem sufixo explícito `DOM`) operam de Segunda a Sábado
+    (`SEG`..`SAB`), ficando aos Domingos apenas setores explícitos de Domingo (`SCDOM*`, `DOM`).
     """
     dt = _parse_data_iso(data_iso)
     if dt is None:
@@ -538,7 +543,12 @@ def setor_visivel_na_data(
         nth, eh_ultimo = _ordinal_dia_no_mes(dt)
         return (str(nth) in ords) or ("L" in ords and eh_ultimo)
 
-    if regra in ("INTERVALO", "DIAS_FIXOS", "PADRAO_DOMINGO", "PADRAO_DIARIO", "PADRAO_PAR", "PADRAO_IMPAR"):
+    if regra == "PADRAO_DIARIO":
+        if not incluir_diario_domingo and dia_sigla == "DOM":
+            return False
+        return dia_sigla in info["dias_semana"]
+
+    if regra in ("INTERVALO", "DIAS_FIXOS", "PADRAO_DOMINGO", "PADRAO_PAR", "PADRAO_IMPAR"):
         return dia_sigla in info["dias_semana"]
 
     # SEM_AGENDA_PADRAO (ex.: SCA*, SCS*, SCDIST*, SCFEIRA*, SCRURAL*, SCEXTRA* sem sufixo)

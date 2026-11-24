@@ -25,6 +25,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, Optional
 
 import database as db
+import indicadores
 import malha_rotas
 import snapshots
 from inlog_service import InlogService, formatar_placa_hifen, identificar_contrato
@@ -361,6 +362,71 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
         .btn-inlog:hover { background-color: #E0E7FF; }
 
+        .btn-indicadores {
+            background-color: #ECFDF5;
+            color: #065F46;
+            border: 1px solid #6EE7B7;
+            border-radius: 5px;
+            padding: 2px 8px;
+            font-size: 0.74rem;
+            font-weight: 700;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            height: 27px;
+            transition: all 0.15s;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .btn-indicadores:hover { background-color: #D1FAE5; border-color: #34D399; }
+
+        .ind-mode-tabs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .ind-mode-btn {
+            border: 1.5px solid var(--gray-border);
+            background: #FFFFFF;
+            border-radius: 8px;
+            padding: 10px 12px;
+            text-align: left;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .ind-mode-btn:hover { border-color: var(--locar-green); background: #F0FDF4; }
+        .ind-mode-btn.active {
+            border-color: var(--locar-green);
+            background: #ECFDF5;
+            box-shadow: 0 0 0 2px rgba(0, 136, 68, 0.15);
+        }
+        .ind-mode-title { font-size: 0.82rem; font-weight: 700; color: var(--text-dark); }
+        .ind-mode-desc { font-size: 0.70rem; color: var(--text-muted); margin-top: 2px; }
+        .ind-progress-wrap {
+            background: #F8FAFC;
+            border: 1px solid var(--gray-border);
+            border-radius: 8px;
+            padding: 12px 14px;
+            margin-top: 12px;
+        }
+        .ind-progress-track {
+            width: 100%;
+            height: 10px;
+            background: #E2E8F0;
+            border-radius: 999px;
+            overflow: hidden;
+            margin: 8px 0 6px 0;
+        }
+        .ind-progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #008844, #10B981);
+            border-radius: 999px;
+            transition: width 0.25s ease;
+        }
+
         .btn-outline {
             background-color: transparent;
             color: var(--text-dark);
@@ -509,6 +575,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         body.modo-link-compartilhado #inlogStatusBadge { display: none !important; }
         body.modo-link-compartilhado #btnPlanejadoVsExec,
         body.modo-link-compartilhado #btnVisaoGeral,
+        body.modo-link-compartilhado #btnPainelIndicadores,
         body.modo-link-compartilhado #btnCentralInlog,
         body.modo-link-compartilhado #btnSairAdmin { display: none !important; }
         body.modo-link-compartilhado #btnBaixarCsvLink { display: inline-flex !important; }
@@ -1093,6 +1160,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <button class="btn-outline" id="btnVisaoGeral" title="Monitoramento consolidado de todas as cidades">
                 🌎 Cidades
             </button>
+            <button class="btn-indicadores" id="btnPainelIndicadores" title="Abrir Painel de Indicadores e exportar Excel completo por cidade">
+                📈 Indicadores
+            </button>
             <button class="btn-inlog" id="btnCentralInlog" title="Central de Módulos da API Inlog">
                 📊 Central Inlog
             </button>
@@ -1523,6 +1593,105 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div class="modal-footer">
                 <button type="button" class="btn-outline" id="btnRefreshVisaoGeral">🔄 Atualizar</button>
                 <button type="button" class="btn-locar" id="btnFecharVisaoGeral">Fechar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL PAINEL DE INDICADORES (EXPORTAÇÃO EXCEL MULTI-CIDADES) -->
+    <div id="modalPainelIndicadores" class="modal-backdrop" style="display:none;">
+        <div class="modal-card modal-lg">
+            <div class="modal-header">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <div class="modal-icon-badge">📈</div>
+                    <div>
+                        <h3 class="modal-title">Painel de Indicadores · Mapa de Execução</h3>
+                        <p class="modal-subtitle">Extração em Excel (.xlsx) no formato oficial com todas as 36 colunas e uma aba por cidade</p>
+                    </div>
+                </div>
+                <button type="button" class="modal-close-btn" id="btnCloseIndicadores">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="ind-mode-tabs">
+                    <button type="button" class="ind-mode-btn active" id="btnIndModoDia" data-modo="dia">
+                        <div class="ind-mode-title">📅 Exportar Dia Único</div>
+                        <div class="ind-mode-desc">Extrai os indicadores completos de uma data específica</div>
+                    </button>
+                    <button type="button" class="ind-mode-btn" id="btnIndModoMes" data-modo="mes">
+                        <div class="ind-mode-title">🗓️ Exportar Por Mês</div>
+                        <div class="ind-mode-desc">Extrai o mês inteiro (ou do dia 01 até hoje, se em andamento)</div>
+                    </button>
+                </div>
+
+                <div class="modal-form-grid" style="align-items:end;">
+                    <div class="sidebar-field" id="indCampoDia">
+                        <label for="indInputData">Data Específica:</label>
+                        <input type="date" id="indInputData" />
+                    </div>
+                    <div class="sidebar-field" id="indCampoMes" style="display:none;">
+                        <label for="indInputMes">Mês / Ano de Referência:</label>
+                        <input type="month" id="indInputMes" />
+                    </div>
+                    <div class="sidebar-field">
+                        <label>Período que será exportado:</label>
+                        <div id="indPeriodoResumo" class="share-sectors-summary" style="color:#065F46; background:#ECFDF5; border-color:#A7F3D0;">--</div>
+                    </div>
+                </div>
+
+                <div class="sidebar-field" style="margin-top:12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:5px;">
+                        <label style="margin-bottom:0;">Cidades / Abas incluídas no Excel:</label>
+                        <div style="display:flex; gap:6px;">
+                            <button type="button" class="btn-chip" id="btnIndMarcarTodas">Todas as Cidades</button>
+                            <button type="button" class="btn-chip" id="btnIndDesmarcarTodas">Limpar</button>
+                        </div>
+                    </div>
+                    <div id="indCidadesGrid" class="cities-checkbox-grid" style="grid-template-columns: repeat(3, 1fr); max-height:135px;"></div>
+                </div>
+
+                <div id="indProgressBox" class="ind-progress-wrap" style="display:none;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.78rem;">
+                        <strong id="indProgressLabel" style="color:#0F172A;">Preparando extração...</strong>
+                        <strong id="indProgressPct" style="color:var(--locar-green-dark);">0%</strong>
+                    </div>
+                    <div class="ind-progress-track">
+                        <div class="ind-progress-bar" id="indProgressBar"></div>
+                    </div>
+                    <div id="indProgressSub" style="font-size:0.72rem; color:var(--text-muted);">Aguarde enquanto os indicadores de todas as cidades são consolidados...</div>
+                </div>
+
+                <div id="indResumoWrap" style="display:none; margin-top:14px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                        <h4 style="font-size:0.78rem; color:#334155; text-transform:uppercase; margin:0;">📊 Resumo por Cidade (Abas do Relatório)</h4>
+                        <span id="indResumoMeta" style="font-size:0.72rem; color:#64748B;"></span>
+                    </div>
+                    <div class="data-table-wrap" style="max-height:240px;">
+                        <table class="inlog-table">
+                            <thead>
+                                <tr>
+                                    <th>Aba / Cidade</th>
+                                    <th>Contrato</th>
+                                    <th>Dias Oper.</th>
+                                    <th>Sem Agend.</th>
+                                    <th>% Coleta</th>
+                                    <th>% c/ Falha GPS</th>
+                                    <th>% Falha GPS</th>
+                                    <th>% Manual</th>
+                                    <th>Linhas</th>
+                                </tr>
+                            </thead>
+                            <tbody id="indResumoTbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn-outline" id="btnIndBaixarNovamente" style="display:none; margin-right:auto;">
+                    ⬇ Baixar Excel Novamente
+                </button>
+                <button type="button" class="btn-outline" id="btnFecharIndicadores">Fechar</button>
+                <button type="button" class="btn-locar" id="btnGerarExcelIndicadores">
+                    📥 Gerar e Baixar Excel (.xlsx)
+                </button>
             </div>
         </div>
     </div>
@@ -3520,6 +3689,231 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         // ====================================================================
+        // PAINEL DE INDICADORES (EXTRAÇÃO EXCEL OFICIAL MULTI-CIDADES)
+        // ====================================================================
+        let indModoAtual = 'dia';
+        let indJobIdAtual = null;
+        let indPollTimer = null;
+        let indDownloadUrlAtual = null;
+
+        function popularCidadesIndicadores() {
+            const grid = document.getElementById('indCidadesGrid');
+            const sel = document.getElementById('selectCidade');
+            if (!grid || !sel) return;
+            grid.innerHTML = '';
+            const opcoes = Array.from(sel.options)
+                .filter(o => o.value && o.value !== 'all')
+                .sort((a, b) => a.textContent.localeCompare(b.textContent, 'pt-BR'));
+            opcoes.forEach(opt => {
+                const lbl = document.createElement('label');
+                lbl.className = 'city-checkbox-item';
+                lbl.innerHTML = `<input type="checkbox" class="ind-city-chk" value="${escapeHtml(opt.value)}" checked /> <span>${escapeHtml(opt.textContent)}</span>`;
+                grid.appendChild(lbl);
+            });
+        }
+
+        function atualizarResumoPeriodoIndicadores() {
+            const el = document.getElementById('indPeriodoResumo');
+            if (!el) return;
+            const hojeIso = formatDataHojeISO();
+            if (indModoAtual === 'dia') {
+                const d = document.getElementById('indInputData')?.value || hojeIso;
+                if (/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+                    const [a, m, dia] = d.split('-');
+                    el.innerText = `${dia}/${m}/${a} (1 dia)`;
+                } else {
+                    el.innerText = 'Selecione uma data válida';
+                }
+            } else {
+                const mv = document.getElementById('indInputMes')?.value || hojeIso.slice(0, 7);
+                if (/^\d{4}-\d{2}$/.test(mv)) {
+                    const [aStr, mStr] = mv.split('-');
+                    const ano = parseInt(aStr, 10), mes = parseInt(mStr, 10);
+                    const ultDia = new Date(ano, mes, 0).getDate();
+                    const fimTeorico = `${aStr}-${mStr}-${String(ultDia).padStart(2, '0')}`;
+                    const iniStr = `${aStr}-${mStr}-01`;
+                    if (iniStr > hojeIso) {
+                        el.innerText = 'Mês futuro ainda não iniciado';
+                        return;
+                    }
+                    const fimReal = fimTeorico > hojeIso ? hojeIso : fimTeorico;
+                    const diaFimNum = parseInt(fimReal.split('-')[2], 10);
+                    const [fa, fm, fd] = fimReal.split('-');
+                    const tag = fimTeorico > hojeIso ? 'mês em andamento — até hoje' : 'mês completo';
+                    el.innerText = `01/${mStr}/${aStr} até ${fd}/${fm}/${fa} (${diaFimNum} dias · ${tag})`;
+                } else {
+                    el.innerText = 'Selecione um mês válido';
+                }
+            }
+        }
+
+        function setModoIndicadores(modo) {
+            indModoAtual = (modo === 'mes') ? 'mes' : 'dia';
+            document.getElementById('btnIndModoDia')?.classList.toggle('active', indModoAtual === 'dia');
+            document.getElementById('btnIndModoMes')?.classList.toggle('active', indModoAtual === 'mes');
+            const cDia = document.getElementById('indCampoDia');
+            const cMes = document.getElementById('indCampoMes');
+            if (cDia) cDia.style.display = indModoAtual === 'dia' ? '' : 'none';
+            if (cMes) cMes.style.display = indModoAtual === 'mes' ? '' : 'none';
+            atualizarResumoPeriodoIndicadores();
+        }
+
+        function abrirPainelIndicadores() {
+            const modal = document.getElementById('modalPainelIndicadores');
+            if (!modal) return;
+            popularCidadesIndicadores();
+            const hojeIso = formatDataHojeISO();
+            const dataToolbar = document.getElementById('inputData')?.value || hojeIso;
+            const inpData = document.getElementById('indInputData');
+            const inpMes = document.getElementById('indInputMes');
+            if (inpData) {
+                inpData.max = hojeIso;
+                inpData.value = dataToolbar <= hojeIso ? dataToolbar : hojeIso;
+            }
+            if (inpMes) {
+                inpMes.max = hojeIso.slice(0, 7);
+                inpMes.value = (dataToolbar <= hojeIso ? dataToolbar : hojeIso).slice(0, 7);
+            }
+            setModoIndicadores(indModoAtual);
+            modal.style.display = 'flex';
+        }
+
+        function renderizarResumoIndicadores(lista, metaTxt) {
+            const wrap = document.getElementById('indResumoWrap');
+            const tbody = document.getElementById('indResumoTbody');
+            const meta = document.getElementById('indResumoMeta');
+            if (!wrap || !tbody) return;
+            if (!lista || lista.length === 0) {
+                wrap.style.display = 'none';
+                return;
+            }
+            wrap.style.display = 'block';
+            if (meta && metaTxt) meta.innerText = metaTxt;
+            tbody.innerHTML = lista.map(c => {
+                const pct = Number(c.pct_coleta || 0);
+                const pillCls = pct >= 90 ? 'pill-green' : (pct >= 75 ? 'pill-amber' : 'pill-red');
+                return `<tr>
+                    <td><b>${escapeHtml(c.aba || c.nome)}</b></td>
+                    <td style="font-size:0.72rem; color:#475569;">${escapeHtml(c.contrato || '')}</td>
+                    <td>${c.dias_operacao ?? 0}</td>
+                    <td>${c.dias_sem_agendamento ?? 0}</td>
+                    <td><span class="pill ${pillCls}">${pct.toFixed(1)}%</span></td>
+                    <td><b>${Number(c.pct_com_falha_gps || 0).toFixed(1)}%</b></td>
+                    <td>${Number(c.pct_falha_gps || 0).toFixed(1)}%</td>
+                    <td>${Number(c.pct_possivel_manual || 0).toFixed(1)}%</td>
+                    <td>${Number(c.linhas || 0).toLocaleString('pt-BR')}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        async function iniciarGeracaoIndicadores() {
+            const btn = document.getElementById('btnGerarExcelIndicadores');
+            const btnAgain = document.getElementById('btnIndBaixarNovamente');
+            const progBox = document.getElementById('indProgressBox');
+            const progBar = document.getElementById('indProgressBar');
+            const progPct = document.getElementById('indProgressPct');
+            const progLbl = document.getElementById('indProgressLabel');
+            const progSub = document.getElementById('indProgressSub');
+
+            const cidadesSel = Array.from(document.querySelectorAll('#indCidadesGrid .ind-city-chk:checked')).map(c => c.value);
+            if (cidadesSel.length === 0) {
+                mostrarToast('Selecione ao menos uma cidade para gerar o relatório.');
+                return;
+            }
+
+            const payload = {
+                modo: indModoAtual,
+                data: document.getElementById('indInputData')?.value || formatDataHojeISO(),
+                mes: document.getElementById('indInputMes')?.value || formatDataHojeISO().slice(0, 7),
+                cidades: cidadesSel
+            };
+
+            clearInterval(indPollTimer);
+            indDownloadUrlAtual = null;
+            if (btn) { btn.disabled = true; btn.innerText = '⏳ Gerando Excel...'; }
+            if (btnAgain) btnAgain.style.display = 'none';
+            if (progBox) progBox.style.display = 'block';
+            if (progBar) progBar.style.width = '2%';
+            if (progPct) progPct.innerText = '0%';
+            if (progLbl) progLbl.innerText = 'Iniciando processamento dos indicadores...';
+            if (progSub) progSub.innerText = 'Consultando auditorias e consolidando as 36 colunas oficiais...';
+            renderizarResumoIndicadores([], '');
+
+            try {
+                const resp = await fetch('/api/indicadores/gerar', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const res = await resp.json();
+                if (!res || !res.sucesso || !res.job_id) {
+                    throw new Error((res && res.erro) || 'Falha ao iniciar geração dos indicadores.');
+                }
+                indJobIdAtual = res.job_id;
+
+                const checarStatus = async () => {
+                    try {
+                        const rSt = await fetch(`/api/indicadores/status?job_id=${encodeURIComponent(indJobIdAtual)}&_t=${Date.now()}`);
+                        const st = await rSt.json();
+                        if (!st || !st.sucesso) {
+                            clearInterval(indPollTimer);
+                            throw new Error((st && st.erro) || 'Job de indicadores não encontrado.');
+                        }
+                        const pct = Math.max(0, Math.min(100, Number(st.progresso_pct || 0)));
+                        if (progBar) progBar.style.width = `${pct}%`;
+                        if (progPct) progPct.innerText = `${pct.toFixed(0)}%`;
+                        if (progLbl) {
+                            progLbl.innerText = st.status === 'done'
+                                ? `✔ Relatório pronto: ${st.filename || 'Indicadores.xlsx'}`
+                                : `Processando ${st.cidade_atual || ''} · ${st.data_atual || ''}`;
+                        }
+                        if (progSub) {
+                            progSub.innerText = st.status === 'done'
+                                ? `${st.total_abas || 0} abas · ${Number(st.total_linhas || 0).toLocaleString('pt-BR')} linhas · ${st.tamanho_kb || 0} KB · Gerado em ${st.gerado_em || ''}`
+                                : `Etapa ${st.etapas_concluidas || 0} de ${st.etapas_total || 0} (reaproveitando cache quando disponível)...`;
+                        }
+                        if (st.resumo_cidades && st.resumo_cidades.length > 0) {
+                            renderizarResumoIndicadores(
+                                st.resumo_cidades,
+                                `${st.resumo_cidades.length} de ${st.total_abas || st.resumo_cidades.length} cidades processadas`
+                            );
+                        }
+
+                        if (st.status === 'done') {
+                            clearInterval(indPollTimer);
+                            indDownloadUrlAtual = st.download_url;
+                            if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
+                            if (btnAgain) btnAgain.style.display = 'inline-flex';
+                            mostrarToast('Excel de Indicadores gerado! Iniciando download...');
+                            if (indDownloadUrlAtual) {
+                                window.location.href = indDownloadUrlAtual;
+                            }
+                        } else if (st.status === 'error') {
+                            clearInterval(indPollTimer);
+                            if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
+                            if (progLbl) progLbl.innerText = '❌ Erro na geração do relatório';
+                            if (progSub) progSub.innerText = st.erro || 'Erro inesperado.';
+                            mostrarToast('Erro ao gerar indicadores: ' + (st.erro || 'Falha'));
+                        }
+                    } catch (errPoll) {
+                        clearInterval(indPollTimer);
+                        if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
+                        if (progLbl) progLbl.innerText = '❌ Erro de comunicação';
+                        if (progSub) progSub.innerText = errPoll.message || 'Falha ao consultar progresso.';
+                    }
+                };
+
+                await checarStatus();
+                indPollTimer = setInterval(checarStatus, 750);
+            } catch (err) {
+                if (btn) { btn.disabled = false; btn.innerText = '📥 Gerar e Baixar Excel (.xlsx)'; }
+                if (progLbl) progLbl.innerText = '❌ Não foi possível iniciar a extração';
+                if (progSub) progSub.innerText = err.message || 'Erro desconhecido.';
+                mostrarToast(err.message || 'Erro ao gerar indicadores.');
+            }
+        }
+
+        // ====================================================================
         // MODAL DE COMPARTILHAMENTO (LINK SEGURO ASSINADO COM CIDADE ÚNICA)
         // ====================================================================
         function abrirModalShare() {
@@ -3822,6 +4216,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('btnCloseVisaoGeral').addEventListener('click', () => document.getElementById('modalVisaoGeral').style.display = 'none');
         document.getElementById('btnFecharVisaoGeral').addEventListener('click', () => document.getElementById('modalVisaoGeral').style.display = 'none');
         document.getElementById('btnRefreshVisaoGeral').addEventListener('click', abrirVisaoGeral);
+
+        document.getElementById('btnPainelIndicadores')?.addEventListener('click', abrirPainelIndicadores);
+        document.getElementById('btnCloseIndicadores')?.addEventListener('click', () => {
+            document.getElementById('modalPainelIndicadores').style.display = 'none';
+        });
+        document.getElementById('btnFecharIndicadores')?.addEventListener('click', () => {
+            document.getElementById('modalPainelIndicadores').style.display = 'none';
+        });
+        document.getElementById('btnIndModoDia')?.addEventListener('click', () => setModoIndicadores('dia'));
+        document.getElementById('btnIndModoMes')?.addEventListener('click', () => setModoIndicadores('mes'));
+        document.getElementById('indInputData')?.addEventListener('change', atualizarResumoPeriodoIndicadores);
+        document.getElementById('indInputMes')?.addEventListener('change', atualizarResumoPeriodoIndicadores);
+        document.getElementById('btnIndMarcarTodas')?.addEventListener('click', () => {
+            document.querySelectorAll('#indCidadesGrid .ind-city-chk').forEach(c => { c.checked = true; });
+        });
+        document.getElementById('btnIndDesmarcarTodas')?.addEventListener('click', () => {
+            document.querySelectorAll('#indCidadesGrid .ind-city-chk').forEach(c => { c.checked = false; });
+        });
+        document.getElementById('btnGerarExcelIndicadores')?.addEventListener('click', iniciarGeracaoIndicadores);
+        document.getElementById('btnIndBaixarNovamente')?.addEventListener('click', () => {
+            if (indDownloadUrlAtual) window.location.href = indDownloadUrlAtual;
+        });
 
         document.getElementById('btnShareLink').addEventListener('click', abrirModalShare);
         document.getElementById('btnPrintMapaCidade')?.addEventListener('click', capturarMapaECopiarTexto);
@@ -4248,6 +4664,33 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"sucesso": True, "snapshots": snapshots.listar_snapshots(contrato_id=cid_filtro)})
             return
 
+        # 3c. Status da Geração do Excel de Indicadores
+        if path == "/api/indicadores/status":
+            job_id = query.get("job_id", [""])[0]
+            st = indicadores.obter_status_job(job_id)
+            if not st:
+                self._send_json({"sucesso": False, "erro": "Job de indicadores não encontrado ou expirado."}, status=404)
+                return
+            self._send_json({"sucesso": True, **st})
+            return
+
+        # 3d. Download do Arquivo Excel (.xlsx) de Indicadores
+        if path == "/api/indicadores/download":
+            job_id = query.get("job_id", [""])[0]
+            arq = indicadores.obter_arquivo_job(job_id)
+            if not arq:
+                self._send_json({"sucesso": False, "erro": "Arquivo Excel não encontrado ou ainda em geração."}, status=404)
+                return
+            xlsx_bytes, filename = arq
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(xlsx_bytes)))
+            self.end_headers()
+            self.wfile.write(xlsx_bytes)
+            return
+
         # 4. Exportação GeoJSON da Malha Viária Local
         if path == "/api/exportar-geojson":
             if (not is_admin) and (viewer_lock is not None or REQUIRE_ADMIN_LOGIN):
@@ -4654,6 +5097,27 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 snap_id = str(dados.get("id") or "").strip()
                 ok = snapshots.revogar_snapshot(snap_id)
                 self._send_json({"sucesso": ok})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        # 0d. Iniciar Geração do Excel de Indicadores (Dia Único ou Mês)
+        if path == "/api/indicadores/gerar":
+            try:
+                modo = str(dados.get("modo") or "dia").lower().strip()
+                data_str = dados.get("data")
+                mes_str = dados.get("mes")
+                cidades_req = dados.get("cidades")
+                if not isinstance(cidades_req, list):
+                    cidades_req = None
+                job = indicadores.iniciar_job_indicadores(
+                    engine=engine,
+                    modo=modo,
+                    data_str=data_str,
+                    mes_str=mes_str,
+                    cidades=cidades_req,
+                )
+                self._send_json({"sucesso": True, **job})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return
