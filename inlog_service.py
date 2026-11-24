@@ -253,6 +253,8 @@ class InlogService:
             print(f"[INLOG] Aviso ao criar inlog_gps_janelas: {e}")
 
     def _obter_fetch_ate(self, placa_chave: str, data_iso: str) -> Optional[str]:
+        if db.IS_POSTGRES:
+            return None
         conn = None
         try:
             conn = db.get_connection()
@@ -268,7 +270,7 @@ class InlogService:
                 conn.close()
 
     def _atualizar_fetch_ate(self, placa_chave: str, data_iso: str, fetch_ate: str):
-        if not fetch_ate:
+        if not fetch_ate or db.IS_POSTGRES:
             return
         with db._write_lock:
             conn = None
@@ -926,7 +928,7 @@ class InlogService:
                 "contrato_id": cid,
             })
 
-        if not registros:
+        if not registros or db.IS_POSTGRES:
             return items_norm
         with db._write_lock:
             conn = None
@@ -1470,9 +1472,9 @@ class InlogService:
                     self._gps_mem_cache.move_to_end(chave_mem)
                     return list(cached_mem[1])
 
-        # Em PostgreSQL (Railway), não persiste milhões de pontos GPS brutos de dias passados em disco;
-        # opera direto em memória (_gps_mem_cache) para nunca estourar o volume do banco.
-        persistir_disco = (not db.IS_POSTGRES) or (data_iso >= hoje_str)
+        # Em PostgreSQL (Railway), não persiste pontos GPS brutos em disco;
+        # opera 100% direto em memória (_gps_mem_cache) para nunca usar o disco nem o pool do banco.
+        persistir_disco = not db.IS_POSTGRES
 
         qtd_local = 0
         max_dt_local = None

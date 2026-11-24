@@ -201,11 +201,11 @@ def resolver_periodo_indicadores(
     }
 
 
-def listar_contratos_indicadores(cidades_filtro: Optional[List[str]] = None) -> List[Dict[str, str]]:
+def listar_contratos_indicadores(cidades_filtro: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Retorna os contratos ordenados alfabeticamente pelo nome oficial da cidade."""
     conn = db.get_connection()
     try:
-        rows = conn.execute("SELECT id, nome FROM contratos ORDER BY nome").fetchall()
+        rows = conn.execute("SELECT id, nome, centro_lat, centro_lon FROM contratos ORDER BY nome").fetchall()
     finally:
         conn.close()
 
@@ -215,16 +215,19 @@ def listar_contratos_indicadores(cidades_filtro: Optional[List[str]] = None) -> 
         if "all" in filtro_norm or "todas" in filtro_norm:
             filtro_norm = None
 
-    contratos: List[Dict[str, str]] = []
+    contratos: List[Dict[str, Any]] = []
     for r in rows:
         cid = str(r["id"]).lower().strip()
         if filtro_norm is not None and cid not in filtro_norm:
             continue
+        c_lat = float(r["centro_lat"]) if r["centro_lat"] is not None else -8.1930
+        c_lon = float(r["centro_lon"]) if r["centro_lon"] is not None else -34.9364
         contratos.append({
             "id": cid,
             "nome": str(r["nome"]),
             "contrato_codigo": normalizar_ascii(cid),
             "aba": _sanitizar_nome_aba(str(r["nome"])),
+            "centro": (c_lat, c_lon),
         })
     return contratos
 
@@ -235,7 +238,7 @@ def _carregar_segmentos_cidade(contrato_id: str) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, setor, setores_json, extensao_m, is_manual
+            SELECT id, setor, setores_json, extensao_m, is_manual, tipo, geom_json
             FROM segmentos_viarios
             WHERE contrato_id = ?
             """,
@@ -250,7 +253,7 @@ def _carregar_segmentos_cidade(contrato_id: str) -> List[Dict[str, Any]]:
         try:
             rows = conn.execute(
                 """
-                SELECT id, setor, setores_json, extensao_m, is_manual
+                SELECT id, setor, setores_json, extensao_m, is_manual, tipo, geom_json
                 FROM segmentos_viarios
                 WHERE contrato_id = ?
                 """,
@@ -271,10 +274,13 @@ def _carregar_segmentos_cidade(contrato_id: str) -> List[Dict[str, Any]]:
         setores_limpos = [str(s or "").strip() for s in s_list if str(s or "").strip()] or [setor_prim]
         segs.append({
             "id": int(r["id"]),
+            "setor": setor_prim,
             "setor_primario": setor_prim,
             "setores": setores_limpos,
             "extensao_m": float(r["extensao_m"] or 0.0),
             "is_manual": bool(r["is_manual"]),
+            "tipo": str(r["tipo"] or "COLETA"),
+            "geom_json": r["geom_json"],
         })
     return segs
 
@@ -351,19 +357,22 @@ def _garantir_auditoria_e_detalhes_dia(
     contrato_id: str,
     data_iso: str,
     inlog_configurado: bool = True,
+    segmentos_cidade: Optional[List[Dict[str, Any]]] = None,
+    centro_cidade: Optional[Tuple[float, float]] = None,
+    verificar_cache: bool = True,
 ) -> Tuple[Optional[int], Optional[Dict[int, Tuple[str, List[str]]]]]:
     """
-    Obtém (audit_id, detalhes_em_memoria) do cache ou executa o motor espacial para o dia.
-    Retorna os detalhes calculados diretamente em memória quando reprocessado, garantindo
-    100% de resiliência mesmo se o disco do banco estiver temporariamente cheio.
+    Executa o motor espacial para o dia 100% em memória (persistir_banco=False),
+    sem gravar índices ou detalhes de auditoria no banco de dados.
     """
-    audit_id = _auditoria_em_cache_valida(
-        contrato_id,
-        data_iso,
-        inlog_configurado=inlog_configurado,
-    )
-    if audit_id is not None:
-        return audit_id, None
+    if verificar_cache and not db.IS_POSTGRES:
+        audit_id = _auditoria_em_cache_valida(
+            contrato_id,
+            data_iso,
+            inlog_configurado=inlog_configurado,
+        )
+        if audit_id is not None:
+            return audit_id, None
 
     try:
         res = engine.processar_ou_obter_auditoria(
@@ -373,15 +382,28 @@ def _garantir_auditoria_e_detalhes_dia(
             forcar_reprocessamento=False,
             operacao="COLETA",
             incluir_geojson=False,
+            persistir_banco=False,
+            segmentos_precarregados=segmentos_cidade,
+            centro_precarregado=centro_cidade,
         )
     except TypeError:
-        res = engine.processar_ou_obter_auditoria(
-            contrato_id=contrato_id,
-            data_iso=data_iso,
-            turno="DIURNO",
-            forcar_reprocessamento=False,
-            operacao="COLETA",
-        )
+        try:
+            res = engine.processar_ou_obter_auditoria(
+                contrato_id=contrato_id,
+                data_iso=data_iso,
+                turno="DIURNO",
+                forcar_reprocessamento=False,
+                operacao="COLETA",
+                incluir_geojson=False,
+            )
+        except TypeError:
+            res = engine.processar_ou_obter_auditoria(
+                contrato_id=contrato_id,
+                data_iso=data_iso,
+                turno="DIURNO",
+                forcar_reprocessamento=False,
+                operacao="COLETA",
+            )
 
     aid = None
     det_mem = None
@@ -395,7 +417,10 @@ def _garantir_auditoria_e_detalhes_dia(
     if aid is not None or det_mem is not None:
         return aid, det_mem
 
-    # Fallback: consulta diretamente no banco
+    if db.IS_POSTGRES:
+        return None, None
+
+    # Fallback apenas para SQLite local / stubs de teste
     conn = None
     try:
         conn = db.get_connection()
@@ -821,24 +846,28 @@ def gerar_excel_indicadores(
             if tem_algum:
                 dias_com_agenda.append(d_iso)
 
-        # Garante auditorias dos dias agendados (paralelizando apenas dias faltantes no cache)
+        # Em PostgreSQL, processa 100% em memória direto para o Excel sem consultar nem gravar auditorias no banco.
         audit_ids_por_dia: Dict[str, Optional[int]] = {}
         detalhes_mem_por_dia: Dict[str, Dict[int, Tuple[str, List[str]]]] = {}
         dias_faltantes: List[str] = []
-        for d_iso in dias_com_agenda:
-            aid_cache = _auditoria_em_cache_valida(
-                cid, d_iso, inlog_configurado=inlog_configurado
-            )
-            if aid_cache is not None:
-                audit_ids_por_dia[d_iso] = aid_cache
-            else:
-                dias_faltantes.append(d_iso)
+        if db.IS_POSTGRES:
+            dias_faltantes = list(dias_com_agenda)
+        else:
+            for d_iso in dias_com_agenda:
+                aid_cache = _auditoria_em_cache_valida(
+                    cid, d_iso, inlog_configurado=inlog_configurado
+                )
+                if aid_cache is not None:
+                    audit_ids_por_dia[d_iso] = aid_cache
+                else:
+                    dias_faltantes.append(d_iso)
 
         # Dias sem agenda ou já em cache válido contam imediatamente na fase de auditoria
         unidades_concluidas += max(0, len(dias_iso) - len(dias_faltantes))
 
         if dias_faltantes:
-            _emitir_progresso(contrato["nome"], f"Auditando {dias_faltantes[0]}...")
+            _emitir_progresso(contrato["nome"], f"Calculando {dias_faltantes[0]}...")
+            centro_cid = contrato.get("centro")
             workers = min(2, len(dias_faltantes))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {
@@ -848,6 +877,9 @@ def gerar_excel_indicadores(
                         cid,
                         d_iso,
                         inlog_configurado,
+                        segs_cidade,
+                        centro_cid,
+                        False,
                     ): d_iso
                     for d_iso in dias_faltantes
                 }

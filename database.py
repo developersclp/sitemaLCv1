@@ -324,9 +324,9 @@ def eh_erro_disco_cheio(exc: Any) -> bool:
 
 def liberar_espaco_emergencia_db(agressivo: bool = False) -> None:
     """
-    Libera espaço imediato em disco no PostgreSQL (Railway) truncando tabelas transitórias
-    de cache bruto (inlog_historico_gps > 1GB, sync_logs, caches temporários), removendo
-    índices redundantes e descartando auditorias corrompidas com 0% de cobertura.
+    Libera espaço imediato em disco no PostgreSQL (Railway) truncando tabelas de histórico
+    e detalhes de auditoria (que não precisam ficar salvas em disco para a planilha Excel),
+    mantendo intactas as malhas viárias e contratos das cidades.
     """
     with _DISK_CLEANUP_LOCK:
         if IS_POSTGRES:
@@ -338,18 +338,20 @@ def liberar_espaco_emergencia_db(agressivo: bool = False) -> None:
                     cur.execute(
                         """
                         TRUNCATE TABLE
+                            auditoria_detalhes,
+                            auditorias,
                             inlog_historico_gps,
                             inlog_gps_janelas,
+                            inlog_relatorios_diarios,
                             inlog_sync_logs,
                             segmentos_viarios_legado,
                             auditorias_periodo_cache
-                        RESTART IDENTITY
+                        RESTART IDENTITY CASCADE
                         """
                     )
                     cur.execute("DROP INDEX IF EXISTS idx_det_status")
                     cur.execute("DROP INDEX IF EXISTS idx_gps_placa_data")
                     cur.execute("DROP INDEX IF EXISTS idx_gps_data")
-                    cur.execute("DELETE FROM auditorias WHERE COALESCE(pct_cobertura, 0) <= 0")
                     if agressivo:
                         cur.execute(
                             """
@@ -360,27 +362,12 @@ def liberar_espaco_emergencia_db(agressivo: bool = False) -> None:
                             RESTART IDENTITY
                             """
                         )
-                print(f"[DB] Espaço em disco recuperado no PostgreSQL (agressivo={agressivo}).")
+                print(f"[DB] Espaço em disco liberado no PostgreSQL (agressivo={agressivo}).")
             except Exception as e:
-                print(f"[DB] Aviso ao truncar caches para liberar espaço: {e}")
+                print(f"[DB] Aviso ao truncar tabelas históricas para liberar espaço: {e}")
             finally:
                 if conn is not None:
                     conn.close()
-
-            if agressivo and psycopg is not None:
-                raw_vac = None
-                try:
-                    raw_vac = psycopg.connect(DATABASE_URL, autocommit=True)
-                    raw_vac.execute("VACUUM auditoria_detalhes")
-                    raw_vac.execute("VACUUM auditorias")
-                except Exception as e:
-                    print(f"[DB] Aviso no VACUUM de emergência: {e}")
-                finally:
-                    if raw_vac is not None:
-                        try:
-                            raw_vac.close()
-                        except Exception:
-                            pass
         else:
             conn = None
             try:
@@ -1019,7 +1006,9 @@ def registrar_sync_log(
     duracao_ms: int,
     mensagem: str = "",
 ):
-    """Registra log de chamada HTTP à API Inlog mantendo os últimos 500 registros sem sobrecarregar o disco."""
+    """Registra log de chamada HTTP à API Inlog (em PostgreSQL evita escritas em disco a cada request)."""
+    if IS_POSTGRES:
+        return
     global _SYNC_LOG_COUNTER
     _SYNC_LOG_COUNTER += 1
     deve_limpar = (_SYNC_LOG_COUNTER % 100 == 0)

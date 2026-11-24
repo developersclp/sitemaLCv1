@@ -368,11 +368,15 @@ class HeatmapEngine:
         operacao: str = "COLETA",
         _retry_malha: int = 0,
         incluir_geojson: bool = True,
+        persistir_banco: Optional[bool] = None,
+        segmentos_precarregados: Optional[List[Dict[str, Any]]] = None,
+        centro_precarregado: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
-        """Executa a auditoria espacial real da cidade na data informada ou recupera do SQLite."""
+        """Executa a auditoria espacial real da cidade na data informada (em memória ou usando cache SQLite)."""
         contrato_id = contrato_id.lower().strip()
         operacao_norm = (operacao or "COLETA").upper().strip()
         turno_chave = turno if operacao_norm == "COLETA" else f"{turno}:{operacao_norm}"
+        deve_persistir = bool(persistir_banco) if persistir_banco is not None else bool(incluir_geojson)
 
         if contrato_id in ("all", "todas", "todas_as_cidades"):
             return self._processar_auditoria_todas_cidades(
@@ -382,105 +386,115 @@ class HeatmapEngine:
                 operacao=operacao_norm,
             )
 
-        # 1. Garante que a malha viária da cidade esteja importada se disponível (antes de abrir conexão)
-        db.importar_malha_cidade_se_necessario(contrato_id)
-
-        # 2. Obtém dados do contrato, segmentos locais e verifica cache de auditoria (conexão de curta duração)
-        win_op = janela_operacional_cidade(contrato_id, data_iso)
-        agora_local_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         c_row = None
-        todos_segmentos = []
-        ref_lat = -8.1930
-        ref_lon = -34.9364
+        if segmentos_precarregados is not None:
+            todos_segmentos = segmentos_precarregados
+            if centro_precarregado is not None:
+                ref_lat, ref_lon = float(centro_precarregado[0]), float(centro_precarregado[1])
+            else:
+                ref_lat, ref_lon = -8.1930, -34.9364
+        else:
+            # 1. Garante que a malha viária da cidade esteja importada se disponível (antes de abrir conexão)
+            db.importar_malha_cidade_se_necessario(contrato_id)
 
-        conn = db.get_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM contratos WHERE id = ?", (contrato_id,))
-            c_row = cur.fetchone()
-            ref_lat = float(c_row["centro_lat"]) if c_row and c_row["centro_lat"] else -8.1930
-            ref_lon = float(c_row["centro_lon"]) if c_row and c_row["centro_lon"] else -34.9364
+            # 2. Obtém dados do contrato, segmentos locais e verifica cache de auditoria (conexão de curta duração)
+            win_op = janela_operacional_cidade(contrato_id, data_iso)
+            agora_local_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            todos_segmentos = []
+            ref_lat = -8.1930
+            ref_lon = -34.9364
 
-            cur.execute(
-                """
-                SELECT id, fid, nome_rua, setor, setores_json, bairro, edge_key, tipo, is_manual, is_priority, extensao_m, geom_json
-                FROM segmentos_viarios
-                WHERE contrato_id = ?
-                """,
-                (contrato_id,),
-            )
-            todos_segmentos = cur.fetchall()
+            conn = db.get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM contratos WHERE id = ?", (contrato_id,))
+                c_row = cur.fetchone()
+                ref_lat = float(c_row["centro_lat"]) if c_row and c_row["centro_lat"] else -8.1930
+                ref_lon = float(c_row["centro_lon"]) if c_row and c_row["centro_lon"] else -34.9364
 
-            # 3. Se já existe auditoria em cache no banco (e foi gerada após o fechamento da janela ou sem atualização pendente), retorna rápido
-            if todos_segmentos and not forcar_reprocessamento:
                 cur.execute(
                     """
-                    SELECT * FROM auditorias
-                    WHERE contrato_id = ? AND data_iso = ? AND turno = ?
+                    SELECT id, fid, nome_rua, setor, setores_json, bairro, edge_key, tipo, is_manual, is_priority, extensao_m, geom_json
+                    FROM segmentos_viarios
+                    WHERE contrato_id = ?
                     """,
-                    (contrato_id, data_iso, turno_chave),
+                    (contrato_id,),
                 )
-                audit_existente = cur.fetchone()
-                if audit_existente:
-                    criado_em_str = str(audit_existente["criado_em"] or "").strip().replace(" ", "T")[:19]
-                    try:
-                        placas_salvas = json.loads(audit_existente["placas_ativas_json"] or "[]")
-                        if not isinstance(placas_salvas, list):
-                            placas_salvas = []
-                    except Exception:
-                        placas_salvas = []
+                todos_segmentos = cur.fetchall()
 
-                    placas_simuladas = {"LOC-1010", "LOC-2020"}
-                    somente_placas_simuladas = (
-                        self.inlog.is_configured()
-                        and bool(placas_salvas)
-                        and all(str(p).upper().strip() in placas_simuladas for p in placas_salvas)
+                # 3. Se já existe auditoria em cache no banco (e foi gerada após o fechamento da janela ou sem atualização pendente), retorna rápido
+                if todos_segmentos and not forcar_reprocessamento and not db.IS_POSTGRES:
+                    cur.execute(
+                        """
+                        SELECT * FROM auditorias
+                        WHERE contrato_id = ? AND data_iso = ? AND turno = ?
+                        """,
+                        (contrato_id, data_iso, turno_chave),
                     )
-                    sem_placas_reais = (len(placas_salvas) == 0) or somente_placas_simuladas
-                    auditoria_vazia = (
-                        float(audit_existente["pct_cobertura"] or 0.0) <= 0.0
-                        and (sem_placas_reais or self.inlog.is_configured())
-                        and data_iso <= datetime.now().strftime("%Y-%m-%d")
-                    )
-                    idade_cache_seg = 999999.0
-                    criado_em_valido = len(criado_em_str) == 19 and criado_em_str[10] == "T"
-                    if criado_em_valido:
+                    audit_existente = cur.fetchone()
+                    if audit_existente:
+                        criado_em_str = str(audit_existente["criado_em"] or "").strip().replace(" ", "T")[:19]
                         try:
-                            dt_c = datetime.strptime(criado_em_str, "%Y-%m-%dT%H:%M:%S")
-                            idade_cache_seg = (datetime.now() - dt_c).total_seconds()
+                            placas_salvas = json.loads(audit_existente["placas_ativas_json"] or "[]")
+                            if not isinstance(placas_salvas, list):
+                                placas_salvas = []
                         except Exception:
-                            criado_em_valido = False
+                            placas_salvas = []
 
-                    cache_obsoleto = (
-                        not criado_em_valido
-                        or (criado_em_str < win_op["data_fim"] and agora_local_str > criado_em_str)
-                        or (auditoria_vazia and idade_cache_seg >= 60.0)
-                    )
-                    if not cache_obsoleto:
-                        if not incluir_geojson:
-                            return {
-                                "resumo": {
-                                    "id": int(audit_existente["id"]),
-                                    "contrato_id": contrato_id,
-                                    "data_iso": data_iso,
-                                    "pct_cobertura": float(audit_existente["pct_cobertura"] or 0.0),
+                        placas_simuladas = {"LOC-1010", "LOC-2020"}
+                        somente_placas_simuladas = (
+                            self.inlog.is_configured()
+                            and bool(placas_salvas)
+                            and all(str(p).upper().strip() in placas_simuladas for p in placas_salvas)
+                        )
+                        sem_placas_reais = (len(placas_salvas) == 0) or somente_placas_simuladas
+                        auditoria_vazia = (
+                            float(audit_existente["pct_cobertura"] or 0.0) <= 0.0
+                            and (sem_placas_reais or self.inlog.is_configured())
+                            and data_iso <= datetime.now().strftime("%Y-%m-%d")
+                        )
+                        idade_cache_seg = 999999.0
+                        criado_em_valido = len(criado_em_str) == 19 and criado_em_str[10] == "T"
+                        if criado_em_valido:
+                            try:
+                                dt_c = datetime.strptime(criado_em_str, "%Y-%m-%dT%H:%M:%S")
+                                idade_cache_seg = (datetime.now() - dt_c).total_seconds()
+                            except Exception:
+                                criado_em_valido = False
+
+                        cache_obsoleto = (
+                            not criado_em_valido
+                            or (criado_em_str < win_op["data_fim"] and agora_local_str > criado_em_str)
+                            or (auditoria_vazia and idade_cache_seg >= 60.0)
+                        )
+                        if not cache_obsoleto:
+                            if not incluir_geojson:
+                                return {
+                                    "resumo": {
+                                        "id": int(audit_existente["id"]),
+                                        "contrato_id": contrato_id,
+                                        "data_iso": data_iso,
+                                        "pct_cobertura": float(audit_existente["pct_cobertura"] or 0.0),
+                                    }
                                 }
-                            }
-                        return self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
-        finally:
-            conn.close()
+                            return self._montar_resposta_geojson(conn, audit_existente["id"], dict(audit_existente))
+            finally:
+                conn.close()
 
         # Filtra segmentos pela agenda oficial da nomenclatura de cada setor na data consultada (em memória, sem conexão aberta)
         segmentos = []
         setores_visibilidade_cache: Dict[str, bool] = {}
         for seg in todos_segmentos:
-            setor_primario = seg["setor"]
-            try:
-                setores_seg = json.loads(seg["setores_json"]) if seg["setores_json"] else [setor_primario]
-                if not isinstance(setores_seg, list) or not setores_seg:
+            if isinstance(seg, dict) and "setores" in seg and isinstance(seg["setores"], list):
+                setores_seg = seg["setores"]
+            else:
+                setor_primario = seg["setor"]
+                try:
+                    setores_seg = json.loads(seg["setores_json"]) if seg["setores_json"] else [setor_primario]
+                    if not isinstance(setores_seg, list) or not setores_seg:
+                        setores_seg = [setor_primario]
+                except Exception:
                     setores_seg = [setor_primario]
-            except Exception:
-                setores_seg = [setor_primario]
 
             visivel = False
             for s in setores_seg:
@@ -496,7 +510,7 @@ class HeatmapEngine:
                 segmentos.append(seg)
 
         if not segmentos and todos_segmentos:
-            if all(str(s["setor"] or "S/S").upper() == "S/S" for s in todos_segmentos):
+            if all(str((s.get("setor_primario") if isinstance(s, dict) and "setor_primario" in s else s["setor"]) or "S/S").upper() == "S/S" for s in todos_segmentos):
                 segmentos = todos_segmentos
 
         # 4. Coleta frota real e pontos GPS reais da Inlog em paralelo (sem segurar conexão do banco)
@@ -534,17 +548,24 @@ class HeatmapEngine:
 
         for seg in segmentos:
             ext = float(seg["extensao_m"] or 0.0)
-            try:
-                coords = json.loads(seg["geom_json"])
-            except Exception:
-                coords = []
+            amostras = seg.get("_amostras_xy") if isinstance(seg, dict) else None
+            if amostras is None:
+                try:
+                    coords = seg.get("_coords") if isinstance(seg, dict) and "_coords" in seg else json.loads(seg["geom_json"])
+                except Exception:
+                    coords = []
+                amostras = self._amostrar_segmento_xy(coords, ref_lat, ref_lon, passo_m=10.0)
+                if isinstance(seg, dict):
+                    seg["_amostras_xy"] = amostras
+                    seg["_coords"] = coords
+            else:
+                coords = seg.get("_coords") or []
 
-            amostras = self._amostrar_segmento_xy(coords, ref_lat, ref_lon, passo_m=10.0)
             n_amostras = len(amostras)
             matched_pass, placas_pass = self._consultar_grade(amostras, pass_grid, buffer_m)
             ratio = (matched_pass / n_amostras) if n_amostras > 0 else 0.0
 
-            eh_via_manual = bool(seg["is_manual"]) or (str(seg["tipo"] or "").upper() == "MANUAL")
+            eh_via_manual = bool(seg.get("is_manual") if isinstance(seg, dict) else seg["is_manual"]) or (str((seg.get("tipo") if isinstance(seg, dict) else seg["tipo"]) or "").upper() == "MANUAL")
             coberta_por_passagem = (n_amostras <= 4 and matched_pass >= 1) or (ratio >= 0.30 and matched_pass >= 1)
 
             if coberta_por_passagem and not eh_via_manual:
@@ -670,7 +691,7 @@ class HeatmapEngine:
             and len(segmentos) > 0
         )
 
-        if not nao_persistir_zero:
+        if deve_persistir and not nao_persistir_zero:
             for tentativa_db in range(2):
                 conn_w = None
                 try:
