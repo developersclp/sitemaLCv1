@@ -160,36 +160,6 @@ class TestIntegracaoInlog(unittest.TestCase):
         freq_esperada = malha_rotas.info_frequencia_data(self.hoje)["frequencia"]
         self.assertEqual(res1["resumo"]["frequencia_dia"]["frequencia"], freq_esperada)
 
-    def test_05_persistencia_gis_sqlite(self):
-        criado = db.salvar_ou_atualizar_segmento({
-            "contrato_id": "cabo",
-            "nome_rua": "Rua Teste Integração Inlog",
-            "setor": "SETOR-TST",
-            "tipo": "COLETA",
-            "is_manual": False,
-            "is_priority": True,
-            "coordinates": [[-35.0333, -8.2833], [-35.0323, -8.2833]],
-        })
-        seg_id = criado["id"]
-        self.assertGreater(seg_id, 0)
-        self.assertGreater(criado["extensao_m"], 90.0)
-        self.assertEqual(criado["is_priority"], 1)
-
-        atualizado = db.salvar_ou_atualizar_segmento({
-            "id": seg_id,
-            "contrato_id": "cabo",
-            "nome_rua": "Rua Teste Atualizada",
-            "setor": "SETOR-TST-2",
-            "tipo": "MANUAL",
-            "is_manual": True,
-            "is_priority": False,
-        })
-        self.assertEqual(atualizado["nome_rua"], "Rua Teste Atualizada")
-        self.assertEqual(atualizado["is_manual"], 1)
-
-        removido = db.excluir_segmento(seg_id)
-        self.assertTrue(removido)
-
     def test_06_rotas_http_app_py(self):
         session = requests.Session()
         login_resp = session.post(
@@ -214,7 +184,6 @@ class TestIntegracaoInlog(unittest.TestCase):
             ("/api/inlog/logs", "application/json"),
             ("/api/rota-planejada?cidade=caruaru&setor=SCPD%2020", "application/json"),
             ("/api/malha-viaria?cidade=caruaru&bbox=-35.99,-8.30,-35.96,-8.27", "application/json"),
-            ("/api/exportar-geojson?cidade=cabo", "application/geo+json"),
         ]
 
         audit_id = None
@@ -223,7 +192,7 @@ class TestIntegracaoInlog(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, f"Falha na rota {path}: HTTP {resp.status_code}")
             self.assertIn(expected_ct, resp.headers.get("Content-Type", ""))
 
-            if expected_ct.startswith("application/") and path != "/api/exportar-geojson":
+            if expected_ct.startswith("application/"):
                 js = resp.json()
                 if path.startswith("/api/auditoria"):
                     audit_id = js["resumo"]["id"]

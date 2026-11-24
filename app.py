@@ -5,7 +5,7 @@ Desenvolvido para Locar Saneamento Ambiental.
 Integração completa 100% real com a API Inlog (Inlog.Integration.Coleta.Api):
 1. Cruzamento espacial real GPS x Malha Viária (sem dados simulados/aleatórios).
 2. Todos os 10 endpoints do manual Inlog disponíveis em camadas no mapa e na Central Inlog.
-3. Monitoramento multi-cidades em tempo real e Modo de Edição GIS (QGIS Web) no SQLite.
+3. Monitoramento multi-cidades em tempo real.
 4. Preservação integral de filtros multi-setor, vias prioritárias (Azul Safira), CSV e links Read-Only.
 """
 
@@ -189,8 +189,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
             --locar-green-dark: #005C2E;
             --locar-green-light: #E8F5E9;
             --locar-green-hover: #007338;
-            --edit-amber: #D97706;
-            --edit-amber-dark: #92400E;
             --priority-blue: #1D4ED8;
             --inlog-indigo: #4338CA;
             --gray-bg: #F8FAFC;
@@ -446,31 +444,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
         .btn-outline:hover { background-color: var(--gray-bg); border-color: #CBD5E1; }
 
-        .btn-edit-mode {
-            background-color: #FEF3C7;
-            color: var(--edit-amber-dark);
-            border: 1px solid #FCD34D;
-            border-radius: 5px;
-            padding: 2px 8px;
-            font-size: 0.74rem;
-            font-weight: 700;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            height: 27px;
-            transition: all 0.15s;
-            white-space: nowrap;
-            flex-shrink: 0;
-        }
-        .btn-edit-mode:hover { background-color: #FDE68A; }
-        .btn-edit-mode.active {
-            background-color: var(--edit-amber);
-            color: #FFFFFF;
-            border-color: var(--edit-amber-dark);
-            box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.3);
-        }
-
         .frequencia-pill-box {
             display: inline-flex;
             align-items: center;
@@ -580,8 +553,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         body.modo-link-compartilhado #btnSairAdmin { display: none !important; }
         body.modo-link-compartilhado #btnBaixarCsvLink { display: inline-flex !important; }
         body.modo-link-compartilhado #secCamadasInlog { display: none !important; }
-        body.modo-link-compartilhado #gisToolbar,
-        body.modo-link-compartilhado #panelEdicaoGIS { display: none !important; }
 
         /* BOTÃO E CABEÇALHO MOBILE (OCULTOS NO DESKTOP) */
         .mobile-panel-toggle {
@@ -642,73 +613,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
             display: none;
             box-shadow: 0 8px 20px rgba(0,0,0,0.25);
             border-left: 4px solid #38BDF8;
-        }
-
-        /* BARRA DE INSTRUÇÃO DE DESENHO FLUTUANTE */
-        #drawInstructionBox {
-            position: absolute;
-            top: 14px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(15, 23, 42, 0.95);
-            backdrop-filter: blur(4px);
-            color: #FFFFFF;
-            padding: 8px 18px;
-            border-radius: 30px;
-            font-size: 0.80rem;
-            font-weight: 600;
-            box-shadow: 0 6px 18px rgba(0,0,0,0.25);
-            z-index: 1000;
-            display: none;
-            align-items: center;
-            gap: 12px;
-            border: 1px solid rgba(255,255,255,0.2);
-        }
-        #drawInstructionBox button {
-            background: #E2E8F0;
-            border: none;
-            border-radius: 14px;
-            padding: 3px 10px;
-            font-size: 0.74rem;
-            font-weight: 700;
-            cursor: pointer;
-            color: #0F172A;
-        }
-
-        /* TOOLBAR GIS FLUTUANTE ESTILO QGIS */
-        #gisToolbar {
-            position: absolute;
-            top: 14px;
-            left: 56px;
-            background: #FFFFFF;
-            border: 1px solid var(--gray-border);
-            border-radius: 8px;
-            padding: 5px;
-            box-shadow: 0 6px 16px rgba(0,0,0,0.12);
-            z-index: 999;
-            display: none;
-            gap: 6px;
-            flex-wrap: wrap;
-        }
-        .gis-tool-btn {
-            background: #F1F5F9;
-            border: 1px solid #CBD5E1;
-            border-radius: 6px;
-            padding: 6px 10px;
-            font-size: 0.76rem;
-            font-weight: 600;
-            color: var(--text-dark);
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            transition: all 0.15s;
-        }
-        .gis-tool-btn:hover { background: #E2E8F0; }
-        .gis-tool-btn.active {
-            background: var(--edit-amber);
-            color: white;
-            border-color: var(--edit-amber-dark);
         }
 
         /* SIDEBAR DIREITA */
@@ -1242,10 +1146,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div class="badge-readonly" id="badgeReadOnly" style="display:none;">
                 🔒 Somente Leitura
             </div>
-
-            <button class="btn-edit-mode" id="btnToggleEditMode" title="Ativar painel de edição do projeto e malhas">
-                ✏ <span id="textEditMode">Edição GIS</span>
-            </button>
         </div>
     </div>
 
@@ -1284,27 +1184,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <!-- BANNER PARA CIDADES SEM MALHA VIÁRIA IMPORTADA -->
         <div id="noMeshBanner">
             <b>ℹ Malha viária GeoJSON não carregada para esta cidade.</b><br/>
-            Frota em tempo real, rastro GPS real da Inlog, setores, RD, alarmes, falhas e telemetria funcionam normalmente. Use <b>Edição do Projeto -> Importar Malha</b> para carregar as ruas.
-        </div>
-
-        <!-- BARRA DE INSTRUÇÃO DE DESENHO FLUTUANTE -->
-        <div id="drawInstructionBox">
-            <span id="drawInstructionText">📍 1º Clique: Marque o INÍCIO da nova rua.</span>
-            <button id="btnCancelDrawing">Cancelar</button>
-        </div>
-
-        <!-- BARRA FLUTUANTE DE FERRAMENTAS GIS (QGIS) -->
-        <div id="gisToolbar">
-            <button class="gis-tool-btn active" id="toolSelect">🔍 Selecionar</button>
-            <button class="gis-tool-btn" id="toolDrawLine">➕ Desenhar Rua</button>
-            <button class="gis-tool-btn" id="toolDelete">🗑 Apagar Rua</button>
-            <button class="gis-tool-btn" id="toolExportGeoJson" style="background:#EFF6FF; color:#1D4ED8; border-color:#BFDBFE;">
-                📥 Exportar GeoJSON
-            </button>
-            <button class="gis-tool-btn" id="toolImportGeoJson" style="background:#DCFCE7; color:var(--locar-green-dark); border-color:#86EFAC;">
-                📤 Importar Malha GeoJSON
-            </button>
-            <input type="file" id="inputImportGeoJson" accept=".geojson,.json" style="display:none;" />
+            Frota em tempo real, rastro GPS real da Inlog, setores, RD, alarmes, falhas e telemetria funcionam normalmente. As malhas viárias são carregadas automaticamente a partir dos arquivos oficiais (.gpkg).
         </div>
 
         <!-- SIDEBAR DIREITA -->
@@ -1475,57 +1355,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         <div class="legend-row"><span><span class="legend-color-dot" style="background:#0080FF;"></span> Manual: 40-60%</span><strong id="legM40">--</strong></div>
                         <div class="legend-row"><span><span class="legend-color-dot" style="background:#0040FF;"></span> Manual: 20-40%</span><strong id="legM20">--</strong></div>
                         <div class="legend-row"><span><span class="legend-color-dot" style="background:#001F66;"></span> Manual: 0-20%</span><strong id="legM0">--</strong></div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- PAINEL 2: EDITOR DO PROJETO DA CIDADE (MODO EDICAO) -->
-            <div id="panelEdicaoGIS" style="display:none;">
-                <div class="sidebar-section" style="background:#FEF3C7; border-left:4px solid var(--edit-amber);">
-                    <h4 style="color:var(--edit-amber-dark); margin-bottom:4px;">✏ Edição do Projeto da Cidade</h4>
-                    <p style="font-size:0.74rem; color:#78350F;">
-                        As alterações modificam o projeto local no SQLite (<b>locar.db</b>) e recalculam a auditoria real contra o GPS da Inlog.
-                    </p>
-                </div>
-
-                <div class="sidebar-section">
-                    <h4>Atributos do Trecho no Projeto</h4>
-                    <div class="sidebar-field">
-                        <label>ID do Segmento:</label>
-                        <input type="text" id="editId" readonly style="background:#F1F5F9; color:#64748B;" value="Nenhum selecionado" />
-                    </div>
-                    <div class="sidebar-field">
-                        <label for="editNomeRua">Nome do Logradouro / Rua:</label>
-                        <input type="text" id="editNomeRua" placeholder="Ex: Rua Nova Esperança" />
-                    </div>
-                    <div class="sidebar-field">
-                        <label for="editSetorInput">Setor do Projeto:</label>
-                        <input type="text" id="editSetorInput" list="datalistSetores" placeholder="Ex: SCDD 14" />
-                        <datalist id="datalistSetores"></datalist>
-                    </div>
-                    <div class="sidebar-field">
-                        <label for="editTipo">Tipo de Coleta:</label>
-                        <select id="editTipo">
-                            <option value="COLETA">COLETA REGULAR (Mandatory)</option>
-                            <option value="MANUAL">COLETA MANUAL (Beco/Escadaria)</option>
-                            <option value="DESLOCAMENTO">DESLOCAMENTO (Acesso)</option>
-                        </select>
-                    </div>
-                    <div class="sidebar-field" style="display:flex; align-items:center; gap:8px; margin-top:8px;">
-                        <input type="checkbox" id="editIsPriority" style="width:auto;" />
-                        <label for="editIsPriority" style="margin-bottom:0; cursor:pointer;">🌟 Rua Prioritária (Avenida / Comércio)</label>
-                    </div>
-                    <div class="sidebar-field" style="margin-top:10px;">
-                        <label>Extensão Calculada:</label>
-                        <div style="font-size:0.96rem; font-weight:700; color:var(--text-dark);" id="editExtensao">0.0 metros</div>
-                    </div>
-                    <div style="display:flex; flex-direction:column; gap:8px; margin-top:14px;">
-                        <button class="btn-locar" id="btnSalvarTrecho" style="width:100%; justify-content:center;">
-                            💾 Salvar no Projeto da Cidade
-                        </button>
-                        <button class="btn-outline" id="btnExcluirTrecho" style="width:100%; justify-content:center; color:var(--danger-red); border-color:#FECACA;">
-                            🗑 Excluir este Trecho do Projeto
-                        </button>
                     </div>
                 </div>
             </div>
@@ -1794,19 +1623,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let baseMeshLayer = null;
         let baseMeshMoveTimer = null;
 
-        let drawStartMarker = null;
-        let drawEndMarker = null;
-        let drawActivePolyline = null;
-        let drawGuidePolyline = null;
-        let drawingCoordinates = [];
-
         let currentAudit = null;
         let currentFeatures = [];
         let setoresList = [];
         let setorTurnoMap = {};
         let selectedSectors = new Set();
         let lastCenteredCity = null;
-        let isReadOnlyMode = false;
         let isSharedLinkMode = false;
         let sharedToken = null;
         let sharedSnapshotId = null;
@@ -1814,9 +1636,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let sharedPeriodo = 'diario';
         let showSectorLabels = true;
         let showPriorityHighlight = true;
-        let isEditMode = false;
-        let selectedFeature = null;
-        let activeGisTool = 'select';
         let autoRefreshTimer = null;
         let activeCentralTab = 'frota';
         let auditReqSeq = 0;
@@ -1902,20 +1721,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         function ativarModoLinkCompartilhado(lockCfg) {
-            isReadOnlyMode = true;
             isSharedLinkMode = true;
             sharedToken = (lockCfg && lockCfg.token) ? lockCfg.token : null;
             sharedSnapshotId = (lockCfg && lockCfg.snapshot_id) ? lockCfg.snapshot_id : null;
             sharedCongeladoEm = (lockCfg && lockCfg.congelado_em) ? lockCfg.congelado_em : null;
             sharedPeriodo = (lockCfg && lockCfg.periodo) ? String(lockCfg.periodo).toLowerCase() : 'diario';
             document.body.classList.add('modo-link-compartilhado');
-
-            const btnEdit = document.getElementById('btnToggleEditMode');
-            if (btnEdit) btnEdit.style.display = 'none';
-            const gisToolbar = document.getElementById('gisToolbar');
-            if (gisToolbar) gisToolbar.style.display = 'none';
-            const panelEdicao = document.getElementById('panelEdicaoGIS');
-            if (panelEdicao) panelEdicao.style.display = 'none';
 
             // Desativa camadas em tempo real extras no link gerado
             ['chkLayerVeiculosRT', 'chkLayerRastroGPS', 'chkLayerEventos', 'chkLayerRotaPlanejada', 'chkLayerMalhaBase'].forEach(id => {
@@ -2047,8 +1858,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     baseMeshMoveTimer = setTimeout(carregarMalhaBaseMapa, 250);
                 }
             });
-            map.on('click', onMapClickForDrawing);
-            map.on('mousemove', onMapMouseMoveForDrawing);
         }
 
         async function carregarAuditoria(forcar = false) {
@@ -2424,7 +2233,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         function popularSelectsFiltros(dataRes) {
             const selectVeiculo = document.getElementById('filterVeiculo');
-            const datalistSetores = document.getElementById('datalistSetores');
             const multiSetorList = document.getElementById('multiSetorList');
 
             if (dataRes.resumo && dataRes.resumo.frequencia_dia) {
@@ -2449,15 +2257,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 if (lblSub) {
                     lblSub.innerText = f.descricao || `Exibindo apenas setores da frequência ${f.frequencia}.`;
                 }
-            }
-
-            if (datalistSetores) {
-                datalistSetores.innerHTML = '';
-                setoresList.forEach(s => {
-                    const opt = document.createElement('option');
-                    opt.value = s.codigo;
-                    datalistSetores.appendChild(opt);
-                });
             }
 
             renderizarListaSetoresFiltro();
@@ -2670,16 +2469,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
             currentFeatures.forEach(f => {
                 const p = f.properties;
                 const segSectors = (p.sectors && p.sectors.length) ? p.sectors : [p.sector];
-                if (!isEditMode) {
-                    if (filtroTurno !== 'all') {
-                        const atendeTurno = (p.turnos && p.turnos.length)
-                            ? p.turnos.includes(filtroTurno)
-                            : segSectors.some(s => obterTurnoSetor(s) === filtroTurno);
-                        if (!atendeTurno) return;
-                    }
-                    if (selectedSectors.size > 0 && !segSectors.some(s => selectedSectors.has(s))) return;
-                    if (filtroVeiculo !== 'all' && (!p.vehicles || !p.vehicles.includes(filtroVeiculo))) return;
+                if (filtroTurno !== 'all') {
+                    const atendeTurno = (p.turnos && p.turnos.length)
+                        ? p.turnos.includes(filtroTurno)
+                        : segSectors.some(s => obterTurnoSetor(s) === filtroTurno);
+                    if (!atendeTurno) return;
                 }
+                if (selectedSectors.size > 0 && !segSectors.some(s => selectedSectors.has(s))) return;
+                if (filtroVeiculo !== 'all' && (!p.vehicles || !p.vehicles.includes(filtroVeiculo))) return;
 
                 const len = p.len_m || 0;
                 const ehManualEfetiva = (p.status === 'possible_manual') || (Boolean(p.is_manual) && p.status !== 'not_collected');
@@ -2706,7 +2503,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     }
                 }
 
-                if (!isEditMode && filtroColeta !== 'all') {
+                if (filtroColeta !== 'all') {
                     if (filtroColeta === 'domiciliar') {
                         if (Boolean(p.is_manual) || p.status === 'possible_manual') return;
                     } else if (filtroColeta === 'possible_manual') {
@@ -2751,7 +2548,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
             document.getElementById('kpiCobertura').innerText = r.sem_malha_viaria ? 'Sem malha' : (pct.toFixed(2) + ' %');
             document.getElementById('kpiExtensao').innerText = r.sem_malha_viaria
-                ? 'Importe GeoJSON para auditar ruas'
+                ? 'Sem malha viária cadastrada'
                 : `${(coletadoScopeM / 1000).toFixed(2)} / ${(totalScopeM / 1000).toFixed(2)} km coletados`;
             document.getElementById('kpiTotalKm').innerText = r.sem_malha_viaria ? '-- %' : `${pctManual.toFixed(1)} %`;
             document.getElementById('kpiTotalVias').innerText = r.sem_malha_viaria
@@ -2823,10 +2620,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     }
 
                     let weight = (p.is_priority && showPriorityHighlight) ? 4.0 : (ehManual ? 3.6 : 3.0);
-                    if (selectedFeature && selectedFeature.properties.id === p.id) {
-                        cor = '#7C3AED';
-                        weight = 6.0;
-                    }
                     return { color: cor, weight, opacity: 1.0, lineCap: 'round', lineJoin: 'round' };
                 },
                 onEachFeature: function(feat, layer) {
@@ -2837,15 +2630,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     layer.bindTooltip(`<b>${escapeHtml(p.street_name)}</b> · ${escapeHtml(p.sector)}${prioTxt}${perTxt}${veicTxt}`, { sticky: true });
 
                     layer.on('click', function(e) {
-                        if (isEditMode && !isReadOnlyMode) {
-                            if (activeGisTool === 'draw') {
-                                L.DomEvent.stopPropagation(e);
-                                processarCliqueDesenho(e.latlng);
-                                return;
-                            }
-                            selecionarSegmento(feat);
-                            return;
-                        }
                         const stMap = {
                             'collected': 'Coletada',
                             'not_collected': 'Não Coletada (Omissão)',
@@ -2981,209 +2765,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
             } catch (err) {
                 console.warn('Erro ao capturar imagem do mapa:', err);
                 mostrarToast('Texto copiado para o Ctrl+V!');
-            }
-        }
-
-        // ====================================================================
-        // MODO EDIÇÃO GIS (QGIS WEB)
-        // ====================================================================
-        function toggleEditMode() {
-            isEditMode = !isEditMode;
-            document.getElementById('btnToggleEditMode').classList.toggle('active', isEditMode);
-            document.getElementById('panelAuditoria').style.display = isEditMode ? 'none' : 'block';
-            document.getElementById('panelEdicaoGIS').style.display = isEditMode ? 'block' : 'none';
-            document.getElementById('gisToolbar').style.display = isEditMode ? 'flex' : 'none';
-            if (isEditMode) setGisTool('select');
-            else { cancelarDesenho(); aplicarFiltros(); }
-        }
-
-        function setGisTool(tool) {
-            activeGisTool = tool;
-            ['toolSelect', 'toolDrawLine', 'toolDelete'].forEach(id => {
-                const b = document.getElementById(id);
-                if (b) b.classList.remove('active');
-            });
-            const instrBox = document.getElementById('drawInstructionBox');
-            if (tool === 'select') {
-                document.getElementById('toolSelect').classList.add('active');
-                document.getElementById('map').style.cursor = 'default';
-                instrBox.style.display = 'none';
-                cancelarDesenho();
-            } else if (tool === 'draw') {
-                document.getElementById('toolDrawLine').classList.add('active');
-                document.getElementById('map').style.cursor = 'crosshair';
-                iniciarModoDesenho();
-            } else if (tool === 'delete') {
-                document.getElementById('toolDelete').classList.add('active');
-                excluirTrecho();
-            }
-        }
-
-        function iniciarModoDesenho() {
-            cancelarDesenho();
-            document.getElementById('drawInstructionBox').style.display = 'flex';
-            document.getElementById('drawInstructionText').innerHTML = '📍 <b>1º Clique:</b> Marque o INÍCIO da nova rua no mapa.';
-            document.getElementById('editId').value = "NOVA RUA DO PROJETO";
-            document.getElementById('editNomeRua').value = "";
-            document.getElementById('editExtensao').innerText = "Aguardando traçado...";
-        }
-
-        function onMapClickForDrawing(e) {
-            if (!isEditMode || activeGisTool !== 'draw') return;
-            processarCliqueDesenho(e.latlng);
-        }
-
-        function processarCliqueDesenho(latlng) {
-            const instrText = document.getElementById('drawInstructionText');
-            if (drawingCoordinates.length === 0) {
-                drawingCoordinates.push([latlng.lat, latlng.lng]);
-                drawStartMarker = L.circleMarker([latlng.lat, latlng.lng], {
-                    radius: 7, fillColor: '#00A859', color: '#FFFFFF', weight: 2, fillOpacity: 1
-                }).addTo(map).bindTooltip("Início", { permanent: true, direction: 'top' });
-                instrText.innerHTML = '📍 <b>Próximo Clique:</b> Adicione vértices ou marque o FIM da rua.';
-            } else {
-                drawingCoordinates.push([latlng.lat, latlng.lng]);
-                if (drawGuidePolyline) { map.removeLayer(drawGuidePolyline); drawGuidePolyline = null; }
-                if (drawActivePolyline) map.removeLayer(drawActivePolyline);
-                drawActivePolyline = L.polyline(drawingCoordinates, { color: '#2563EB', weight: 5, dashArray: '6, 6' }).addTo(map);
-                if (drawEndMarker) map.removeLayer(drawEndMarker);
-                drawEndMarker = L.circleMarker([latlng.lat, latlng.lng], {
-                    radius: 7, fillColor: '#E53935', color: '#FFFFFF', weight: 2, fillOpacity: 1
-                }).addTo(map).bindTooltip("Fim", { permanent: true, direction: 'bottom' });
-                document.getElementById('editExtensao').innerText = calcularDistanciaMetros(drawingCoordinates).toFixed(1) + ' metros';
-                instrText.innerHTML = '✔ <b>Traçado pronto!</b> Preencha os atributos ao lado e clique em <b>Salvar no Projeto</b>.';
-                document.getElementById('editNomeRua').focus();
-            }
-        }
-
-        function onMapMouseMoveForDrawing(e) {
-            if (!isEditMode || activeGisTool !== 'draw' || drawingCoordinates.length === 0) return;
-            const coordsGuia = [drawingCoordinates[drawingCoordinates.length - 1], [e.latlng.lat, e.latlng.lng]];
-            if (drawGuidePolyline) drawGuidePolyline.setLatLngs(coordsGuia);
-            else drawGuidePolyline = L.polyline(coordsGuia, { color: '#2563EB', weight: 2.5, dashArray: '4, 6', opacity: 0.8 }).addTo(map);
-        }
-
-        function cancelarDesenho() {
-            if (drawStartMarker) map.removeLayer(drawStartMarker);
-            if (drawEndMarker) map.removeLayer(drawEndMarker);
-            if (drawActivePolyline) map.removeLayer(drawActivePolyline);
-            if (drawGuidePolyline) map.removeLayer(drawGuidePolyline);
-            drawStartMarker = drawEndMarker = drawActivePolyline = drawGuidePolyline = null;
-            drawingCoordinates = [];
-            document.getElementById('drawInstructionBox').style.display = 'none';
-        }
-
-        function calcularDistanciaMetros(coords) {
-            let total = 0.0;
-            for (let i = 0; i < coords.length - 1; i++) {
-                total += L.latLng(coords[i][0], coords[i][1]).distanceTo(L.latLng(coords[i+1][0], coords[i+1][1]));
-            }
-            return total;
-        }
-
-        function selecionarSegmento(feat) {
-            selectedFeature = feat;
-            const p = feat.properties;
-            document.getElementById('editId').value = p.id;
-            document.getElementById('editNomeRua').value = p.street_name;
-            document.getElementById('editSetorInput').value = p.sector;
-            document.getElementById('editTipo').value = p.tipo || (p.is_manual ? 'MANUAL' : 'COLETA');
-            document.getElementById('editIsPriority').checked = p.is_priority || false;
-            document.getElementById('editExtensao').innerText = p.len_m + ' metros';
-            cancelarDesenho();
-            aplicarFiltros();
-        }
-
-        async function salvarAlteracoesNoProjeto() {
-            const cidade = document.getElementById('selectCidade').value;
-            const idVal = document.getElementById('editId').value;
-            const nomeRua = document.getElementById('editNomeRua').value.trim();
-            const setor = document.getElementById('editSetorInput').value.trim() || 'S/S';
-            const tipo = document.getElementById('editTipo').value;
-            const isPriority = document.getElementById('editIsPriority').checked;
-
-            if (!nomeRua) { alert('Informe o nome do logradouro / rua.'); document.getElementById('editNomeRua').focus(); return; }
-            const payload = { contrato_id: cidade, nome_rua: nomeRua, setor, tipo, is_manual: (tipo === 'MANUAL'), is_priority: isPriority };
-            const isNova = (idVal === "NOVA RUA DO PROJETO" || idVal === "Nenhum selecionado" || !idVal);
-
-            if (!isNova) payload.id = parseInt(idVal);
-            else {
-                if (drawingCoordinates.length < 2) return alert('Clique em "Desenhar Rua" e trace o trecho no mapa.');
-                payload.coordinates = drawingCoordinates.map(pt => [pt[1], pt[0]]);
-            }
-
-            document.getElementById('loadingOverlay').style.display = 'flex';
-            document.getElementById('loadingText').innerText = 'Salvando trecho no SQLite e recalculando auditoria real...';
-            try {
-                const resp = await fetch('/api/segmento/salvar', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-                });
-                const res = await resp.json();
-                if (res.sucesso) {
-                    mostrarToast('Projeto atualizado no SQLite!');
-                    cancelarDesenho();
-                    setGisTool('select');
-                    await carregarAuditoria(true);
-                } else alert('Erro ao salvar: ' + (res.erro || 'Falha'));
-            } catch (err) {
-                console.error(err);
-                alert('Erro de comunicação ao salvar.');
-            } finally {
-                document.getElementById('loadingOverlay').style.display = 'none';
-            }
-        }
-
-        async function excluirTrecho() {
-            const idVal = document.getElementById('editId').value;
-            if (!idVal || idVal === "NOVA RUA DO PROJETO" || idVal === "Nenhum selecionado") {
-                return alert('Selecione uma rua no mapa antes de apagar.');
-            }
-            if (!confirm(`Remover o trecho ID ${idVal} do Projeto da Cidade?`)) return;
-            document.getElementById('loadingOverlay').style.display = 'flex';
-            try {
-                const resp = await fetch('/api/segmento/excluir', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: parseInt(idVal) })
-                });
-                const res = await resp.json();
-                if (res.sucesso) {
-                    mostrarToast('Trecho removido do projeto!');
-                    selectedFeature = null;
-                    document.getElementById('editId').value = "Nenhum selecionado";
-                    await carregarAuditoria(true);
-                }
-            } catch (err) {
-                console.error(err);
-            } finally {
-                document.getElementById('loadingOverlay').style.display = 'none';
-            }
-        }
-
-        async function importarGeoJsonArquivo(file) {
-            if (!file) return;
-            const cidade = document.getElementById('selectCidade').value;
-            const substituir = confirm(`Deseja SUBSTITUIR toda a malha existente de ${CIDADES_MAPA[cidade] || cidade}?\n\nOK = Substituir malha inteira\nCancelar = Adicionar ao projeto atual`);
-            try {
-                const texto = await file.text();
-                const geojson = JSON.parse(texto);
-                document.getElementById('loadingOverlay').style.display = 'flex';
-                document.getElementById('loadingText').innerText = 'Importando malha GeoJSON para o SQLite...';
-                const resp = await fetch('/api/malha/importar', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ contrato_id: cidade, geojson, substituir })
-                });
-                const res = await resp.json();
-                if (res.sucesso) {
-                    mostrarToast(`${res.importados} segmentos importados com sucesso!`);
-                    await carregarAuditoria(true);
-                } else {
-                    alert('Erro na importação: ' + (res.erro || 'GeoJSON inválido'));
-                }
-            } catch (e) {
-                alert('Erro ao ler arquivo GeoJSON: ' + e.message);
-            } finally {
-                document.getElementById('loadingOverlay').style.display = 'none';
-                document.getElementById('inputImportGeoJson').value = '';
             }
         }
 
@@ -4174,25 +3755,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // ====================================================================
         // BINDINGS DE EVENTOS
         // ====================================================================
-        document.getElementById('btnToggleEditMode').addEventListener('click', toggleEditMode);
-        document.getElementById('toolSelect').addEventListener('click', () => setGisTool('select'));
-        document.getElementById('toolDrawLine').addEventListener('click', () => setGisTool('draw'));
-        document.getElementById('toolDelete').addEventListener('click', () => setGisTool('delete'));
-        document.getElementById('btnCancelDrawing').addEventListener('click', () => setGisTool('select'));
-        document.getElementById('btnSalvarTrecho').addEventListener('click', salvarAlteracoesNoProjeto);
-        document.getElementById('btnExcluirTrecho').addEventListener('click', excluirTrecho);
-
-        document.getElementById('toolExportGeoJson').addEventListener('click', () => {
-            const cidade = document.getElementById('selectCidade').value;
-            window.location.href = `/api/exportar-geojson?cidade=${encodeURIComponent(cidade)}`;
-        });
-        document.getElementById('toolImportGeoJson').addEventListener('click', () => {
-            document.getElementById('inputImportGeoJson').click();
-        });
-        document.getElementById('inputImportGeoJson').addEventListener('change', (e) => {
-            importarGeoJsonArquivo(e.target.files[0]);
-        });
-
         document.getElementById('filterColeta').addEventListener('change', () => {
             const fc = document.getElementById('filterColeta').value;
             const selOp = document.getElementById('selectOperacao');
@@ -4801,45 +4363,6 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(xlsx_bytes)
             return
 
-        # 4. Exportação GeoJSON da Malha Viária Local
-        if path == "/api/exportar-geojson":
-            if (not is_admin) and (viewer_lock is not None or REQUIRE_ADMIN_LOGIN):
-                self._send_json({"sucesso": False, "erro": "Acesso restrito ao Painel Central."}, status=403)
-                return
-            cidade = query.get("cidade", ["cabo"])[0].lower().strip()
-            conn = db.get_connection()
-            try:
-                rows = conn.execute(
-                    "SELECT id, fid, nome_rua, setor, tipo, is_manual, is_priority, extensao_m, geom_json FROM segmentos_viarios WHERE contrato_id = ?",
-                    (cidade,),
-                ).fetchall()
-                features = [
-                    {
-                        "type": "Feature",
-                        "geometry": {"type": "LineString", "coordinates": json.loads(r["geom_json"])},
-                        "properties": {
-                            "id": r["id"],
-                            "fid": r["fid"],
-                            "street_name": r["nome_rua"],
-                            "sector": r["setor"],
-                            "tipo": r["tipo"],
-                            "is_manual": bool(r["is_manual"]),
-                            "is_priority": bool(r["is_priority"]),
-                            "len_m": r["extensao_m"],
-                        },
-                    }
-                    for r in rows
-                ]
-                geojson = {"type": "FeatureCollection", "features": features}
-                self.send_response(200)
-                self.send_header("Content-Type", "application/geo+json; charset=utf-8")
-                self.send_header("Content-Disposition", f'attachment; filename="malha_{cidade}.geojson"')
-                self.end_headers()
-                self.wfile.write(json.dumps(geojson, ensure_ascii=False).encode("utf-8"))
-            finally:
-                conn.close()
-            return
-
         # 5. Status da Conexão Inlog
         if path == "/api/status":
             saude = inlog.status_conexao()
@@ -5230,70 +4753,6 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"sucesso": True, **job})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
-            return
-
-        # 1. Salvar ou Criar Segmento no Projeto
-        if path == "/api/segmento/salvar":
-            try:
-                res = db.salvar_ou_atualizar_segmento(dados)
-                contrato_id = str(dados.get("contrato_id", "")).lower().strip()
-                if contrato_id:
-                    conn = db.get_connection()
-                    try:
-                        with conn:
-                            conn.execute("DELETE FROM auditorias WHERE contrato_id = ?", (contrato_id,))
-                    finally:
-                        conn.close()
-                self._send_json({"sucesso": True, "segmento": res})
-            except Exception as e:
-                self._send_json({"sucesso": False, "erro": str(e)}, status=500)
-            return
-
-        # 2. Excluir Segmento do Projeto
-        if path == "/api/segmento/excluir":
-            try:
-                seg_id = dados.get("id")
-                conn = db.get_connection()
-                try:
-                    row = conn.execute("SELECT contrato_id FROM segmentos_viarios WHERE id = ?", (seg_id,)).fetchone()
-                    contrato_id = row["contrato_id"] if row else None
-                finally:
-                    conn.close()
-
-                db.excluir_segmento(seg_id)
-
-                if contrato_id:
-                    conn = db.get_connection()
-                    try:
-                        with conn:
-                            conn.execute("DELETE FROM auditorias WHERE contrato_id = ?", (contrato_id,))
-                    finally:
-                        conn.close()
-                self._send_json({"sucesso": True})
-            except Exception as e:
-                self._send_json({"sucesso": False, "erro": str(e)}, status=500)
-            return
-
-        # 3. Importar Malha GeoJSON para qualquer cidade
-        if path == "/api/malha/importar":
-            try:
-                contrato_id = dados.get("contrato_id", "")
-                geojson_obj = dados.get("geojson") or {}
-                substituir = bool(dados.get("substituir", False))
-                qtd = db.importar_malha_geojson(contrato_id, geojson_obj, substituir=substituir)
-                self._send_json({"sucesso": True, "importados": qtd})
-            except Exception as e:
-                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
-            return
-
-        # 4. Reconstruir Projeto a partir da Malha Viária (.gpkg) e Rotas Planejadas
-        if path == "/api/malha/reconstruir":
-            try:
-                contrato_id = dados.get("contrato_id", "")
-                res = malha_rotas.construir_projeto_cidade(contrato_id, forcar=True)
-                self._send_json(res)
-            except Exception as e:
-                self._send_json({"sucesso": False, "erro": str(e)}, status=500)
             return
 
         self.send_response(404)
