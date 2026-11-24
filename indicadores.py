@@ -292,8 +292,9 @@ def _auditoria_em_cache_valida(
     agora_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     hoje_str = datetime.now().strftime("%Y-%m-%d")
 
-    conn = db.get_connection()
+    conn = None
     try:
+        conn = db.get_connection()
         rows = conn.execute(
             """
             SELECT id, pct_cobertura, placas_ativas_json, criado_em
@@ -303,8 +304,12 @@ def _auditoria_em_cache_valida(
             """,
             (contrato_id, data_iso),
         ).fetchall()
+    except Exception as e:
+        print(f"[INDICADORES] Aviso ao consultar cache de auditoria ({contrato_id} {data_iso}): {e}")
+        return None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     for aud in rows:
         criado_em = str(aud["criado_em"] or "").strip().replace(" ", "T")[:19]
@@ -327,7 +332,7 @@ def _auditoria_em_cache_valida(
         sem_placas_reais = (len(placas) == 0) or somente_placas_simuladas
         auditoria_vazia = (
             float(aud["pct_cobertura"] or 0.0) <= 0.0
-            and sem_placas_reais
+            and (sem_placas_reais or inlog_configurado)
             and data_iso <= hoje_str
         )
         if auditoria_vazia:
@@ -341,20 +346,24 @@ def _auditoria_em_cache_valida(
     return None
 
 
-def _garantir_auditoria_dia(
+def _garantir_auditoria_e_detalhes_dia(
     engine: Any,
     contrato_id: str,
     data_iso: str,
     inlog_configurado: bool = True,
-) -> Optional[int]:
-    """Obtém o audit_id válido do cache ou executa o motor espacial para o dia."""
+) -> Tuple[Optional[int], Optional[Dict[int, Tuple[str, List[str]]]]]:
+    """
+    Obtém (audit_id, detalhes_em_memoria) do cache ou executa o motor espacial para o dia.
+    Retorna os detalhes calculados diretamente em memória quando reprocessado, garantindo
+    100% de resiliência mesmo se o disco do banco estiver temporariamente cheio.
+    """
     audit_id = _auditoria_em_cache_valida(
         contrato_id,
         data_iso,
         inlog_configurado=inlog_configurado,
     )
     if audit_id is not None:
-        return audit_id
+        return audit_id, None
 
     try:
         res = engine.processar_ou_obter_auditoria(
@@ -373,13 +382,23 @@ def _garantir_auditoria_dia(
             forcar_reprocessamento=False,
             operacao="COLETA",
         )
-    aid = (res.get("resumo") or {}).get("id") if isinstance(res, dict) else None
-    if aid:
-        return int(aid)
+
+    aid = None
+    det_mem = None
+    if isinstance(res, dict):
+        raw_id = (res.get("resumo") or {}).get("id")
+        if raw_id:
+            aid = int(raw_id)
+        if isinstance(res.get("detalhes_map"), dict):
+            det_mem = res["detalhes_map"]
+
+    if aid is not None or det_mem is not None:
+        return aid, det_mem
 
     # Fallback: consulta diretamente no banco
-    conn = db.get_connection()
+    conn = None
     try:
+        conn = db.get_connection()
         row = conn.execute(
             """
             SELECT id FROM auditorias
@@ -388,23 +407,47 @@ def _garantir_auditoria_dia(
             """,
             (contrato_id, data_iso),
         ).fetchone()
-        return int(row["id"]) if row else None
+        return (int(row["id"]) if row else None), None
+    except Exception:
+        return None, None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
+
+def _garantir_auditoria_dia(
+    engine: Any,
+    contrato_id: str,
+    data_iso: str,
+    inlog_configurado: bool = True,
+) -> Optional[int]:
+    """Obtém o audit_id válido do cache ou executa o motor espacial para o dia."""
+    aid, _ = _garantir_auditoria_e_detalhes_dia(
+        engine=engine,
+        contrato_id=contrato_id,
+        data_iso=data_iso,
+        inlog_configurado=inlog_configurado,
+    )
+    return aid
 
 
 def _carregar_detalhes_auditoria(audit_id: Optional[int]) -> Dict[int, Tuple[str, List[str]]]:
     """Carrega {segmento_id: (status, [placas])} da tabela auditoria_detalhes."""
     if not audit_id:
         return {}
-    conn = db.get_connection()
+    conn = None
     try:
+        conn = db.get_connection()
         rows = conn.execute(
             "SELECT segmento_id, status, placas_responsaveis FROM auditoria_detalhes WHERE auditoria_id = ?",
             (int(audit_id),),
         ).fetchall()
+    except Exception as e:
+        print(f"[INDICADORES] Aviso ao ler detalhes da auditoria {audit_id}: {e}")
+        return {}
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     detalhes: Dict[int, Tuple[str, List[str]]] = {}
     for r in rows:
@@ -707,6 +750,12 @@ def gerar_excel_indicadores(
     dias_iso: List[str] = periodo["dias_iso"]
     gerado_em = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    if db.IS_POSTGRES:
+        try:
+            db.liberar_espaco_emergencia_db(agressivo=False)
+        except Exception:
+            pass
+
     inlog_obj = getattr(engine, "inlog", None)
     if inlog_obj is not None and callable(getattr(inlog_obj, "is_configured", None)):
         inlog_configurado = bool(inlog_obj.is_configured())
@@ -774,6 +823,7 @@ def gerar_excel_indicadores(
 
         # Garante auditorias dos dias agendados (paralelizando apenas dias faltantes no cache)
         audit_ids_por_dia: Dict[str, Optional[int]] = {}
+        detalhes_mem_por_dia: Dict[str, Dict[int, Tuple[str, List[str]]]] = {}
         dias_faltantes: List[str] = []
         for d_iso in dias_com_agenda:
             aid_cache = _auditoria_em_cache_valida(
@@ -789,11 +839,11 @@ def gerar_excel_indicadores(
 
         if dias_faltantes:
             _emitir_progresso(contrato["nome"], f"Auditando {dias_faltantes[0]}...")
-            workers = min(3 if db.IS_POSTGRES else 2, len(dias_faltantes))
+            workers = min(2, len(dias_faltantes))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {
                     pool.submit(
-                        _garantir_auditoria_dia,
+                        _garantir_auditoria_e_detalhes_dia,
                         engine,
                         cid,
                         d_iso,
@@ -804,7 +854,10 @@ def gerar_excel_indicadores(
                 for fut in as_completed(futs):
                     d_f = futs[fut]
                     try:
-                        audit_ids_por_dia[d_f] = fut.result()
+                        aid_res, det_mem_res = fut.result()
+                        audit_ids_por_dia[d_f] = aid_res
+                        if det_mem_res is not None:
+                            detalhes_mem_por_dia[d_f] = det_mem_res
                     except Exception as e:
                         msg_aviso = f"{contrato['nome']} ({d_f}): {e}"
                         print(f"[INDICADORES] Aviso ao auditar {msg_aviso}")
@@ -834,7 +887,12 @@ def gerar_excel_indicadores(
         linhas_aba = 0
 
         for d_iso in dias_iso:
-            detalhes = _carregar_detalhes_auditoria(audit_ids_por_dia.get(d_iso)) if d_iso in audit_ids_por_dia else {}
+            if d_iso in detalhes_mem_por_dia:
+                detalhes = detalhes_mem_por_dia[d_iso]
+            elif d_iso in audit_ids_por_dia:
+                detalhes = _carregar_detalhes_auditoria(audit_ids_por_dia.get(d_iso))
+            else:
+                detalhes = {}
             linhas_dia, res_dia = calcular_linhas_dia_cidade(
                 contrato=contrato,
                 data_iso=d_iso,

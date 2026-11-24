@@ -1106,9 +1106,9 @@ def _gravar_projeto(
             ]
 
             with conn:
-                # 3. Backup integral (sem perda) dos segmentos anteriores que não vieram da malha
+                # 3. Backup integral dos segmentos anteriores que não vieram da malha (apenas em SQLite local)
                 legado = [e for e in existentes if (e.get("origem") or "") != "MALHA_GPKG"]
-                if legado:
+                if legado and not db.IS_POSTGRES:
                     cur.executemany(
                         """
                         INSERT INTO segmentos_viarios_legado

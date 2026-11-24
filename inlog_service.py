@@ -22,6 +22,7 @@ import json
 import time
 import threading
 import unicodedata
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -194,7 +195,10 @@ class InlogService:
         self._cache_lock = threading.Lock()
         self._setores_rt_lock = threading.Lock()
         self._rd_lock = threading.Lock()
+        self._gps_mem_lock = threading.Lock()
         self._mem_cache: Dict[str, Tuple[float, Any]] = {}
+        self._gps_mem_cache: "OrderedDict[Tuple[str, str], Tuple[str, List[Dict[str, Any]]]]" = OrderedDict()
+        self._rd_mem_cache: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
         self._recent_fetches: Dict[str, float] = {}
         self._setores_rt_refreshing = False
 
@@ -227,7 +231,7 @@ class InlogService:
                             """
                         )
                         rows_rd = conn.execute(
-                            "SELECT id, contrato_id, setor, macro_setor, grupo_controle FROM inlog_relatorios_diarios"
+                            "SELECT id, contrato_id, setor, macro_setor, grupo_controle FROM inlog_relatorios_diarios WHERE contrato_id IS NULL"
                         ).fetchall()
                         updates = []
                         for r in rows_rd:
@@ -249,8 +253,9 @@ class InlogService:
             print(f"[INLOG] Aviso ao criar inlog_gps_janelas: {e}")
 
     def _obter_fetch_ate(self, placa_chave: str, data_iso: str) -> Optional[str]:
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             row = conn.execute(
                 "SELECT fetch_ate FROM inlog_gps_janelas WHERE placa = ? AND data_iso = ?",
                 (placa_chave, data_iso),
@@ -259,14 +264,16 @@ class InlogService:
         except Exception:
             return None
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _atualizar_fetch_ate(self, placa_chave: str, data_iso: str, fetch_ate: str):
         if not fetch_ate:
             return
         with db._write_lock:
-            conn = db.get_connection()
+            conn = None
             try:
+                conn = db.get_connection()
                 with conn:
                     atual = conn.execute(
                         "SELECT fetch_ate FROM inlog_gps_janelas WHERE placa = ? AND data_iso = ?",
@@ -279,8 +286,12 @@ class InlogService:
                         "INSERT INTO inlog_gps_janelas (placa, data_iso, fetch_ate) VALUES (?, ?, ?) ON CONFLICT (placa, data_iso) DO UPDATE SET fetch_ate = excluded.fetch_ate",
                         (placa_chave, data_iso, novo),
                     )
+            except Exception as e:
+                if db.eh_erro_disco_cheio(e):
+                    db.liberar_espaco_emergencia_db(agressivo=True)
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     def is_configured(self) -> bool:
         """Verifica se credenciais reais foram informadas no .env."""
@@ -523,8 +534,9 @@ class InlogService:
         if not registros:
             return
         with db._write_lock:
-            conn = db.get_connection()
+            conn = None
             try:
+                conn = db.get_connection()
                 with conn:
                     conn.executemany(
                         """
@@ -556,8 +568,12 @@ class InlogService:
                         """,
                         registros,
                     )
+            except Exception as e:
+                if db.eh_erro_disco_cheio(e):
+                    db.liberar_espaco_emergencia_db(agressivo=True)
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     def _ler_veiculos_tempo_real_db(self) -> List[Dict[str, Any]]:
         conn = db.get_connection()
@@ -703,8 +719,9 @@ class InlogService:
         if not registros:
             return
         with db._write_lock:
-            conn = db.get_connection()
+            conn = None
             try:
+                conn = db.get_connection()
                 with conn:
                     conn.executemany(
                         """
@@ -732,12 +749,17 @@ class InlogService:
                         """,
                         registros,
                     )
+            except Exception as e:
+                if db.eh_erro_disco_cheio(e):
+                    db.liberar_espaco_emergencia_db(agressivo=True)
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     def _ler_setores_tempo_real_db(self, cid_norm: Optional[str]) -> List[Dict[str, Any]]:
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             if cid_norm:
                 rows = conn.execute(
                     "SELECT * FROM inlog_setores_tempo_real WHERE contrato_id = ? ORDER BY macro_setor, setor",
@@ -770,8 +792,11 @@ class InlogService:
                 }
                 for r in rows
             ]
+        except Exception:
+            return []
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     # --------------------------------------------------------------------------
     # ENDPOINT 3: RELATÓRIOS DIÁRIOS - RD / MACROS (GET /api/RelatorioDiario)
@@ -792,8 +817,16 @@ class InlogService:
             return []
 
         with self._rd_lock:
-            usar_cache = False
             fetch_key = f"rd:{data_iso}"
+            if not force_refresh and data_iso in self._rd_mem_cache:
+                if data_iso < hoje_str or self._recent_fetch_valid(fetch_key, 20.0):
+                    self._rd_mem_cache.move_to_end(data_iso)
+                    cached_all = self._rd_mem_cache[data_iso]
+                    if cid_norm:
+                        return [x for x in cached_all if x.get("contrato_id") == cid_norm]
+                    return list(cached_all)
+
+            usar_cache = False
             if self._recent_fetch_valid(fetch_key, 20.0):
                 usar_cache = True
             elif not force_refresh:
@@ -809,15 +842,31 @@ class InlogService:
                 }
                 sucesso, dados, _, _ = self._request_get("/api/RelatorioDiario", params=params, timeout=60)
                 if sucesso and isinstance(dados, list):
-                    self._persistir_relatorios_diarios(data_iso, dados)
+                    items_mem = self._persistir_relatorios_diarios(data_iso, dados)
+                    self._rd_mem_cache[data_iso] = items_mem
+                    self._rd_mem_cache.move_to_end(data_iso)
+                    while len(self._rd_mem_cache) > 45:
+                        self._rd_mem_cache.popitem(last=False)
                     self._mark_recent_fetch(fetch_key)
                     if data_iso < hoje_str:
                         self._atualizar_fetch_ate("__RD__", data_iso, f"{data_iso}T23:59:59")
+                    if cid_norm:
+                        return [x for x in items_mem if x.get("contrato_id") == cid_norm]
+                    return list(items_mem)
 
-        return self._ler_relatorios_diarios_db(data_iso, cid_norm)
+            lidos_db = self._ler_relatorios_diarios_db(data_iso, None)
+            if lidos_db and data_iso < hoje_str:
+                self._rd_mem_cache[data_iso] = lidos_db
+                self._rd_mem_cache.move_to_end(data_iso)
+                while len(self._rd_mem_cache) > 45:
+                    self._rd_mem_cache.popitem(last=False)
+            if cid_norm:
+                return [x for x in lidos_db if x.get("contrato_id") == cid_norm]
+            return lidos_db
 
-    def _persistir_relatorios_diarios(self, data_iso: str, items: List[Dict[str, Any]]):
+    def _persistir_relatorios_diarios(self, data_iso: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         registros = []
+        items_norm: List[Dict[str, Any]] = []
         for item in items:
             macro_setor = str(item.get("macroSetor") or item.get("macrosetor") or "").strip()
             grupo = str(item.get("grupoControle") or "").strip()
@@ -843,27 +892,46 @@ class InlogService:
                 elif campo == "CD_REGIONAL" and not cid:
                     cid = identificar_contrato(valor)
 
+            data_exec = str(item.get("dataExecucao") or "")
+            oper = str(item.get("operacao") or "")
+            veic = str(item.get("veiculo") or "")
+            peso_r = round(peso_total, 2)
             registros.append((
                 data_iso,
-                str(item.get("dataExecucao") or ""),
+                data_exec,
                 grupo,
-                str(item.get("operacao") or ""),
+                oper,
                 macro_setor,
                 setor,
-                str(item.get("veiculo") or ""),
+                veic,
                 placa,
                 controle,
                 json.dumps(macros, ensure_ascii=False),
-                round(peso_total, 2),
+                peso_r,
                 json.dumps(tickets, ensure_ascii=False),
                 cid,
             ))
+            items_norm.append({
+                "dataExecucao": data_exec,
+                "grupoControle": grupo,
+                "operacao": oper,
+                "macroSetor": macro_setor,
+                "setor": setor,
+                "veiculo": veic,
+                "placa": placa,
+                "controle": controle,
+                "macros": macros,
+                "pesoTotalKg": peso_r,
+                "tickets": tickets,
+                "contrato_id": cid,
+            })
 
         if not registros:
-            return
+            return items_norm
         with db._write_lock:
-            conn = db.get_connection()
+            conn = None
             try:
+                conn = db.get_connection()
                 with conn:
                     conn.executemany(
                         """
@@ -885,12 +953,18 @@ class InlogService:
                         """,
                         registros,
                     )
+            except Exception as e:
+                if db.eh_erro_disco_cheio(e):
+                    db.liberar_espaco_emergencia_db(agressivo=True)
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
+        return items_norm
 
     def _ler_relatorios_diarios_db(self, data_iso: str, cid_norm: Optional[str]) -> List[Dict[str, Any]]:
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             if cid_norm:
                 rows = conn.execute(
                     "SELECT * FROM inlog_relatorios_diarios WHERE data_iso = ? AND contrato_id = ? ORDER BY placa, controle",
@@ -918,8 +992,11 @@ class InlogService:
                 }
                 for r in rows
             ]
+        except Exception:
+            return []
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     # --------------------------------------------------------------------------
     # ENDPOINT 4: CADASTRO DE VEÍCULOS (GET /api/Veiculos)
@@ -1307,6 +1384,54 @@ class InlogService:
     # --------------------------------------------------------------------------
     # ENDPOINT 8: HISTÓRICO GPS (GET /api/Historico)
     # --------------------------------------------------------------------------
+    def _normalizar_pontos_gps(
+        self, placa_hifen: str, data_iso: str, pontos: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Normaliza e ordena pontos GPS em memória sem depender de escrita em disco."""
+        por_dt: Dict[str, Dict[str, Any]] = {}
+        for p in pontos or []:
+            lat = _parse_float(p.get("latitude"), 0.0)
+            lon = _parse_float(p.get("longitude"), 0.0)
+            dt_hr = str(p.get("dataHora") or "").strip()
+            if not dt_hr or (lat == 0.0 and lon == 0.0):
+                continue
+            por_dt[dt_hr] = {
+                "dataHora": dt_hr,
+                "operacao": str(p.get("operacao") or ""),
+                "identificador": str(p.get("identificador") or placa_hifen),
+                "placa": placa_hifen,
+                "motorista": str(p.get("motorista") or ""),
+                "matriculaMotorista": str(p.get("matriculaMotorista") or ""),
+                "unidade": str(p.get("unidade") or ""),
+                "consumo": _parse_float(p.get("consumo"), 0.0),
+                "hodometro": _parse_float(p.get("hodometro"), 0.0),
+                "horimetro": _parse_float(p.get("horimetro"), 0.0),
+                "latitude": lat,
+                "longitude": lon,
+                "velocidade": _parse_float(p.get("velocidade"), 0.0),
+            }
+        return [por_dt[k] for k in sorted(por_dt.keys())]
+
+    def _salvar_gps_mem_cache(
+        self, placa_hifen: str, data_iso: str, fetch_ate: str, pts: List[Dict[str, Any]]
+    ) -> None:
+        chave = (placa_hifen, data_iso)
+        with self._gps_mem_lock:
+            anterior = self._gps_mem_cache.get(chave)
+            if anterior and anterior[1] and pts:
+                por_dt = {p["dataHora"]: p for p in anterior[1]}
+                for p in pts:
+                    por_dt[p["dataHora"]] = p
+                pts_merged = [por_dt[k] for k in sorted(por_dt.keys())]
+                fetch_merged = max(str(anterior[0]), str(fetch_ate))
+            else:
+                pts_merged = list(pts)
+                fetch_merged = str(fetch_ate)
+            self._gps_mem_cache[chave] = (fetch_merged, pts_merged)
+            self._gps_mem_cache.move_to_end(chave)
+            while len(self._gps_mem_cache) > 400:
+                self._gps_mem_cache.popitem(last=False)
+
     def get_historico_gps(
         self,
         placa: str,
@@ -1318,9 +1443,9 @@ class InlogService:
         Busca histórico GPS real de 24h da placa na data informada.
         - Sempre envia placa com hífen (AAA-XXXX) como primária.
         - Respeita dataFim < agora - 5 min no dia atual.
-        - Só considera um dia passado completo quando `fetch_ate >= data_iso + 'T23:59:59'`,
-          completando automaticamente caches parciais salvos durante o dia anterior.
-        - Nunca retorna dados simulados quando credenciais reais estão configuradas.
+        - Mantém cache LRU em memória (evita reconsultar D+1 ao avançar os dias da cidade
+          e evita lotar o disco do PostgreSQL com milhões de pontos brutos históricos).
+        - Caso o banco esteja com disco cheio, retorna os pontos diretamente da memória.
         """
         placa_hifen = formatar_placa_hifen(placa)
         if not placa_hifen:
@@ -1336,46 +1461,73 @@ class InlogService:
         hoje_str = datetime.now().strftime("%Y-%m-%d")
         data_inicio, data_fim = janela
         alvo_minimo = ate_hora if (ate_hora and ate_hora < data_fim) else data_fim
-
-        # Verifica cache local e marcador de completude (fetch_ate)
-        conn = db.get_connection()
-        try:
-            row_stats = conn.execute(
-                "SELECT COUNT(*) AS qtd, MAX(data_hora) AS max_dt FROM inlog_historico_gps WHERE placa = ? AND data_iso = ?",
-                (placa_hifen, data_iso),
-            ).fetchone()
-            qtd_local = row_stats["qtd"] if row_stats else 0
-            max_dt_local = row_stats["max_dt"] if row_stats else None
-        finally:
-            conn.close()
-
-        fetch_ate = self._obter_fetch_ate(placa_hifen, data_iso)
+        chave_mem = (placa_hifen, data_iso)
 
         if not force_refresh:
-            if fetch_ate and fetch_ate >= alvo_minimo:
-                return self._ler_historico_gps_db(placa_hifen, data_iso)
-            if data_iso == hoje_str and ate_hora and max_dt_local and str(max_dt_local)[:19] >= ate_hora[:19]:
-                return self._ler_historico_gps_db(placa_hifen, data_iso)
+            with self._gps_mem_lock:
+                cached_mem = self._gps_mem_cache.get(chave_mem)
+                if cached_mem and cached_mem[0] >= alvo_minimo:
+                    self._gps_mem_cache.move_to_end(chave_mem)
+                    return list(cached_mem[1])
 
-            ponto_corte = None
-            if fetch_ate and max_dt_local:
-                ponto_corte = max(str(fetch_ate)[:19], str(max_dt_local)[:19])
-            elif max_dt_local:
-                ponto_corte = str(max_dt_local)[:19]
-            elif fetch_ate:
-                ponto_corte = str(fetch_ate)[:19]
+        # Em PostgreSQL (Railway), não persiste milhões de pontos GPS brutos de dias passados em disco;
+        # opera direto em memória (_gps_mem_cache) para nunca estourar o volume do banco.
+        persistir_disco = (not db.IS_POSTGRES) or (data_iso >= hoje_str)
 
-            if ponto_corte:
-                try:
-                    dt_ult = datetime.strptime(ponto_corte, "%Y-%m-%dT%H:%M:%S")
-                    dt_prox = dt_ult + timedelta(seconds=1)
-                    dt_fim = datetime.strptime(data_fim, "%Y-%m-%dT%H:%M:%S")
-                    if dt_prox >= dt_fim:
-                        self._atualizar_fetch_ate(placa_hifen, data_iso, data_fim)
-                        return self._ler_historico_gps_db(placa_hifen, data_iso)
-                    data_inicio = dt_prox.strftime("%Y-%m-%dT%H:%M:%S")
-                except ValueError:
-                    pass
+        qtd_local = 0
+        max_dt_local = None
+        fetch_ate = None
+
+        if persistir_disco:
+            conn = None
+            try:
+                conn = db.get_connection()
+                row_stats = conn.execute(
+                    "SELECT COUNT(*) AS qtd, MAX(data_hora) AS max_dt FROM inlog_historico_gps WHERE placa = ? AND data_iso = ?",
+                    (placa_hifen, data_iso),
+                ).fetchone()
+                qtd_local = row_stats["qtd"] if row_stats else 0
+                max_dt_local = row_stats["max_dt"] if row_stats else None
+            except Exception:
+                qtd_local = 0
+                max_dt_local = None
+            finally:
+                if conn is not None:
+                    conn.close()
+
+            fetch_ate = self._obter_fetch_ate(placa_hifen, data_iso)
+
+            if not force_refresh:
+                if fetch_ate and fetch_ate >= alvo_minimo:
+                    pts_db = self._ler_historico_gps_db(placa_hifen, data_iso)
+                    self._salvar_gps_mem_cache(placa_hifen, data_iso, fetch_ate, pts_db)
+                    return pts_db
+                if data_iso == hoje_str and ate_hora and max_dt_local and str(max_dt_local)[:19] >= ate_hora[:19]:
+                    pts_db = self._ler_historico_gps_db(placa_hifen, data_iso)
+                    self._salvar_gps_mem_cache(placa_hifen, data_iso, str(max_dt_local)[:19], pts_db)
+                    return pts_db
+
+                ponto_corte = None
+                if fetch_ate and max_dt_local:
+                    ponto_corte = max(str(fetch_ate)[:19], str(max_dt_local)[:19])
+                elif max_dt_local:
+                    ponto_corte = str(max_dt_local)[:19]
+                elif fetch_ate:
+                    ponto_corte = str(fetch_ate)[:19]
+
+                if ponto_corte:
+                    try:
+                        dt_ult = datetime.strptime(ponto_corte, "%Y-%m-%dT%H:%M:%S")
+                        dt_prox = dt_ult + timedelta(seconds=1)
+                        dt_fim = datetime.strptime(data_fim, "%Y-%m-%dT%H:%M:%S")
+                        if dt_prox >= dt_fim:
+                            self._atualizar_fetch_ate(placa_hifen, data_iso, data_fim)
+                            pts_db = self._ler_historico_gps_db(placa_hifen, data_iso)
+                            self._salvar_gps_mem_cache(placa_hifen, data_iso, data_fim, pts_db)
+                            return pts_db
+                        data_inicio = dt_prox.strftime("%Y-%m-%dT%H:%M:%S")
+                    except ValueError:
+                        pass
 
         sucesso, dados, _, _ = self._request_get(
             "/api/Historico",
@@ -1396,12 +1548,23 @@ class InlogService:
                     dados = dados2
                     sucesso = True
 
+        pts_novos: List[Dict[str, Any]] = []
         if sucesso and isinstance(dados, list):
-            if len(dados) > 0:
-                self._persistir_historico_gps(placa_hifen, data_iso, dados)
-            self._atualizar_fetch_ate(placa_hifen, data_iso, data_fim)
+            pts_novos = self._normalizar_pontos_gps(placa_hifen, data_iso, dados)
+            self._salvar_gps_mem_cache(placa_hifen, data_iso, data_fim, pts_novos)
+            if persistir_disco:
+                if len(pts_novos) > 0:
+                    self._persistir_historico_gps(placa_hifen, data_iso, dados)
+                self._atualizar_fetch_ate(placa_hifen, data_iso, data_fim)
 
-        return self._ler_historico_gps_db(placa_hifen, data_iso)
+        with self._gps_mem_lock:
+            cached_now = self._gps_mem_cache.get(chave_mem)
+            if cached_now:
+                return list(cached_now[1])
+
+        if persistir_disco:
+            return self._ler_historico_gps_db(placa_hifen, data_iso)
+        return pts_novos
 
     def get_historico_gps_janela_operacional(
         self,
@@ -1415,6 +1578,7 @@ class InlogService:
           - Padrão: `05:00` de `data_iso` até `05:00` de `data_iso + 1`
           - CUIABA: `04:00` de `data_iso` até `05:00` de `data_iso + 1`
           - OLINDA / PAULISTA: `05:00` de `data_iso` até `07:00` de `data_iso + 1`
+        Filtra e consolida diretamente em memória para máxima performance e resiliência.
         """
         placa_hifen = formatar_placa_hifen(placa)
         if not placa_hifen:
@@ -1432,13 +1596,29 @@ class InlogService:
         if dt_ini_op >= agora_lim:
             return []
 
-        # Garante atualização dos pontos de D e, quando já entrou na madrugada de D+1, também de D+1
-        self.get_historico_gps(placa_hifen, data_iso, force_refresh=force_refresh)
+        pts_d = self.get_historico_gps(placa_hifen, data_iso, force_refresh=force_refresh) or []
+        pts_d1: List[Dict[str, Any]] = []
         if agora_lim > f"{dia_seg}T00:00:00":
             ate_d1 = min(dt_fim_op, agora_lim)
-            self.get_historico_gps(placa_hifen, dia_seg, force_refresh=force_refresh, ate_hora=ate_d1)
+            pts_d1 = self.get_historico_gps(placa_hifen, dia_seg, force_refresh=force_refresh, ate_hora=ate_d1) or []
 
-        return self._ler_historico_gps_intervalo_db(placa_hifen, dt_ini_op, dt_fim_op)
+        lim_fim = dt_fim_op[:19]
+        por_dt: Dict[str, Dict[str, Any]] = {}
+        for p in pts_d:
+            dh = str(p.get("dataHora") or "")
+            if dh >= dt_ini_op and dh[:19] <= lim_fim:
+                por_dt[dh] = p
+        for p in pts_d1:
+            dh = str(p.get("dataHora") or "")
+            if dh >= dt_ini_op and dh[:19] <= lim_fim:
+                por_dt[dh] = p
+
+        if por_dt:
+            return [por_dt[k] for k in sorted(por_dt.keys())]
+
+        if not db.IS_POSTGRES:
+            return self._ler_historico_gps_intervalo_db(placa_hifen, dt_ini_op, dt_fim_op)
+        return []
 
     def _persistir_historico_gps(self, placa_hifen: str, data_iso: str, pontos: List[Dict[str, Any]]):
         registros = []
@@ -1469,8 +1649,9 @@ class InlogService:
         if not registros:
             return
         with db._write_lock:
-            conn = db.get_connection()
+            conn = None
             try:
+                conn = db.get_connection()
                 with conn:
                     conn.executemany(
                         """
@@ -1483,14 +1664,19 @@ class InlogService:
                         """,
                         registros,
                     )
+            except Exception as e:
+                if db.eh_erro_disco_cheio(e):
+                    db.liberar_espaco_emergencia_db(agressivo=True)
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
 
     def _ler_historico_gps_intervalo_db(
         self, placa_hifen: str, dt_ini_str: str, dt_fim_str: str
     ) -> List[Dict[str, Any]]:
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             rows = conn.execute(
                 """
                 SELECT * FROM inlog_historico_gps
@@ -1517,12 +1703,16 @@ class InlogService:
                 }
                 for r in rows
             ]
+        except Exception:
+            return []
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _ler_historico_gps_db(self, placa_hifen: str, data_iso: str) -> List[Dict[str, Any]]:
-        conn = db.get_connection()
+        conn = None
         try:
+            conn = db.get_connection()
             rows = conn.execute(
                 """
                 SELECT * FROM inlog_historico_gps
@@ -1549,8 +1739,11 @@ class InlogService:
                 }
                 for r in rows
             ]
+        except Exception:
+            return []
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     # --------------------------------------------------------------------------
     # ENDPOINT 9: FALHAS (GET /api/Falha)

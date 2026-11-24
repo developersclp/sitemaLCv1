@@ -264,16 +264,31 @@ class _PgConnection:
             except Exception:
                 pass
         if self._pool is not None:
-            self._pool.putconn(self._conn)
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                pass
         else:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
-            self._conn.rollback()
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
         else:
             self._conn.commit()
         return False
@@ -287,8 +302,97 @@ def _get_pg_pool():
         raise RuntimeError("DATABASE_URL aponta para PostgreSQL, mas 'psycopg' não está instalado.")
     with _PG_POOL_LOCK:
         if _PG_POOL is None and ConnectionPool is not None:
-            _PG_POOL = ConnectionPool(DATABASE_URL, min_size=1, max_size=24, timeout=15.0, open=True)
+            _PG_POOL = ConnectionPool(DATABASE_URL, min_size=1, max_size=32, timeout=30.0, open=True)
     return _PG_POOL
+
+
+_DISK_CLEANUP_LOCK = threading.Lock()
+_SYNC_LOG_COUNTER = 0
+
+
+def eh_erro_disco_cheio(exc: Any) -> bool:
+    """Detecta erros de disco cheio no PostgreSQL (DiskFull / No space left on device) ou SQLite."""
+    msg = str(exc or "").lower()
+    return (
+        "no space left on device" in msg
+        or "could not extend file" in msg
+        or "diskfull" in msg
+        or "database or disk is full" in msg
+        or "disk full" in msg
+    )
+
+
+def liberar_espaco_emergencia_db(agressivo: bool = False) -> None:
+    """
+    Libera espaço imediato em disco no PostgreSQL (Railway) truncando tabelas transitórias
+    de cache bruto (inlog_historico_gps > 1GB, sync_logs, caches temporários), removendo
+    índices redundantes e descartando auditorias corrompidas com 0% de cobertura.
+    """
+    with _DISK_CLEANUP_LOCK:
+        if IS_POSTGRES:
+            conn = None
+            try:
+                conn = get_connection()
+                with conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        TRUNCATE TABLE
+                            inlog_historico_gps,
+                            inlog_gps_janelas,
+                            inlog_sync_logs,
+                            segmentos_viarios_legado,
+                            auditorias_periodo_cache
+                        RESTART IDENTITY
+                        """
+                    )
+                    cur.execute("DROP INDEX IF EXISTS idx_det_status")
+                    cur.execute("DROP INDEX IF EXISTS idx_gps_placa_data")
+                    cur.execute("DROP INDEX IF EXISTS idx_gps_data")
+                    cur.execute("DELETE FROM auditorias WHERE COALESCE(pct_cobertura, 0) <= 0")
+                    if agressivo:
+                        cur.execute(
+                            """
+                            TRUNCATE TABLE
+                                inlog_telemetria,
+                                inlog_alarmes,
+                                inlog_falhas
+                            RESTART IDENTITY
+                            """
+                        )
+                print(f"[DB] Espaço em disco recuperado no PostgreSQL (agressivo={agressivo}).")
+            except Exception as e:
+                print(f"[DB] Aviso ao truncar caches para liberar espaço: {e}")
+            finally:
+                if conn is not None:
+                    conn.close()
+
+            if agressivo and psycopg is not None:
+                raw_vac = None
+                try:
+                    raw_vac = psycopg.connect(DATABASE_URL, autocommit=True)
+                    raw_vac.execute("VACUUM auditoria_detalhes")
+                    raw_vac.execute("VACUUM auditorias")
+                except Exception as e:
+                    print(f"[DB] Aviso no VACUUM de emergência: {e}")
+                finally:
+                    if raw_vac is not None:
+                        try:
+                            raw_vac.close()
+                        except Exception:
+                            pass
+        else:
+            conn = None
+            try:
+                conn = get_connection()
+                with conn:
+                    conn.execute("DELETE FROM auditorias_periodo_cache")
+                    conn.execute("DELETE FROM auditorias WHERE COALESCE(pct_cobertura, 0) <= 0")
+            except Exception:
+                pass
+            finally:
+                if conn is not None:
+                    conn.close()
 
 
 def get_connection():
@@ -314,9 +418,18 @@ def get_connection():
 
 def init_db():
     """Cria as tabelas, colunas de migração e índices se não existirem (SQLite e PostgreSQL)."""
+    if IS_POSTGRES:
+        # Caso o volume do PostgreSQL já inicie lotado (ex.: >1GB em inlog_historico_gps),
+        # libera espaço imediatamente via TRUNCATE antes de rodar DDL/migrações.
+        try:
+            liberar_espaco_emergencia_db(agressivo=False)
+        except Exception:
+            pass
+
     conn = get_connection()
-    with conn:
-        ddl_script = """
+    try:
+        with conn:
+            ddl_script = """
             CREATE TABLE IF NOT EXISTS contratos (
                 id TEXT PRIMARY KEY,
                 nome TEXT NOT NULL,
@@ -368,7 +481,6 @@ def init_db():
                 FOREIGN KEY (auditoria_id) REFERENCES auditorias(id) ON DELETE CASCADE,
                 FOREIGN KEY (segmento_id) REFERENCES segmentos_viarios(id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_det_status ON auditoria_detalhes(auditoria_id, status);
 
             -- ================================================================
             -- TABELAS DE INTEGRAÇÃO INLOG (10 ENDPOINTS + LOGS)
@@ -468,8 +580,6 @@ def init_db():
                 unidade TEXT,
                 UNIQUE(placa, data_hora)
             );
-            CREATE INDEX IF NOT EXISTS idx_gps_placa_data ON inlog_historico_gps(placa, data_iso);
-            CREATE INDEX IF NOT EXISTS idx_gps_data ON inlog_historico_gps(data_iso);
 
             CREATE TABLE IF NOT EXISTS inlog_relatorios_diarios (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,60 +751,66 @@ def init_db():
             );
         """
 
-        cur = conn.cursor()
-        if IS_POSTGRES:
-            ddl_pg = ddl_script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-            ddl_pg = re.sub(r"\bBLOB\b", "BYTEA", ddl_pg)
-            for stmt in ddl_pg.split(";"):
-                s = stmt.strip()
-                if s:
-                    cur.execute(s)
-        else:
-            conn.executescript(ddl_script)
+            cur = conn.cursor()
+            if IS_POSTGRES:
+                ddl_pg = ddl_script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+                ddl_pg = re.sub(r"\bBLOB\b", "BYTEA", ddl_pg)
+                for stmt in ddl_pg.split(";"):
+                    s = stmt.strip()
+                    if s:
+                        cur.execute(s)
+            else:
+                conn.executescript(ddl_script)
 
-        # Migração segura de colunas extras em segmentos_viarios (caso banco antigo)
-        migracoes = [
-            ("tipo", "TEXT DEFAULT 'COLETA'"),
-            ("is_manual", "INTEGER DEFAULT 0"),
-            ("is_priority", "INTEGER DEFAULT 0"),
-            ("atualizado_em", "TIMESTAMP"),
-            ("edge_key", "TEXT"),
-            ("setores_json", "TEXT"),
-            ("origem", "TEXT DEFAULT 'LEGADO'"),
-            ("bairro", "TEXT"),
-        ]
-        if IS_POSTGRES:
-            for col_name, col_def in migracoes:
-                cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
-        else:
-            cur.execute("PRAGMA table_info(segmentos_viarios)")
-            colunas_existentes = {row["name"] for row in cur.fetchall()}
-            for col_name, col_def in migracoes:
-                if col_name not in colunas_existentes:
-                    cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN {col_name} {col_def}")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_seg_edge_key ON segmentos_viarios(contrato_id, edge_key)")
+            # Migração segura de colunas extras em segmentos_viarios (caso banco antigo)
+            migracoes = [
+                ("tipo", "TEXT DEFAULT 'COLETA'"),
+                ("is_manual", "INTEGER DEFAULT 0"),
+                ("is_priority", "INTEGER DEFAULT 0"),
+                ("atualizado_em", "TIMESTAMP"),
+                ("edge_key", "TEXT"),
+                ("setores_json", "TEXT"),
+                ("origem", "TEXT DEFAULT 'LEGADO'"),
+                ("bairro", "TEXT"),
+            ]
+            if IS_POSTGRES:
+                for col_name, col_def in migracoes:
+                    cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+            else:
+                cur.execute("PRAGMA table_info(segmentos_viarios)")
+                colunas_existentes = {row["name"] for row in cur.fetchall()}
+                for col_name, col_def in migracoes:
+                    if col_name not in colunas_existentes:
+                        cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN {col_name} {col_def}")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_seg_edge_key ON segmentos_viarios(contrato_id, edge_key)")
 
-        # Popula contratos padrão com ON CONFLICT DO NOTHING (padrão SQLite + PostgreSQL)
-        contratos_iniciais = [
-            ("jaboatao", "Jaboatão dos Guararapes", -8.1930, -34.9364, 12),
-            ("cabo", "Cabo de Santo Agostinho", -8.2833, -35.0333, 12),
-            ("olinda", "Olinda", -7.9986, -34.8459, 13),
-            ("paulista", "Paulista", -7.9408, -34.8728, 12.5),
-            ("caruaru", "Caruaru", -8.2838, -35.9761, 12),
-            ("cuiaba", "Cuiabá", -15.6014, -56.0979, 12),
-            ("garanhuns", "Garanhuns", -8.8907, -36.4966, 13),
-            ("pesqueira", "Pesqueira", -8.3586, -36.6961, 13),
-            ("vitoria", "Vitória de Santo Antão", -8.1189, -35.2928, 13),
-            ("canela", "Canela", -29.3644, -50.8119, 13),
-            ("jequie", "Jequié", -13.8575, -40.0839, 13),
-            ("novo hamburgo", "Novo Hamburgo", -29.6789, -51.1306, 12.5),
-        ]
-        cur.executemany(
-            "INSERT INTO contratos (id, nome, centro_lat, centro_lon, zoom_padrao) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
-            contratos_iniciais,
-        )
-        cur.execute("DELETE FROM contratos WHERE id = 'varzea'")
-    conn.close()
+            # Popula contratos padrão com ON CONFLICT DO NOTHING (padrão SQLite + PostgreSQL)
+            contratos_iniciais = [
+                ("jaboatao", "Jaboatão dos Guararapes", -8.1930, -34.9364, 12),
+                ("cabo", "Cabo de Santo Agostinho", -8.2833, -35.0333, 12),
+                ("olinda", "Olinda", -7.9986, -34.8459, 13),
+                ("paulista", "Paulista", -7.9408, -34.8728, 12.5),
+                ("caruaru", "Caruaru", -8.2838, -35.9761, 12),
+                ("cuiaba", "Cuiabá", -15.6014, -56.0979, 12),
+                ("garanhuns", "Garanhuns", -8.8907, -36.4966, 13),
+                ("pesqueira", "Pesqueira", -8.3586, -36.6961, 13),
+                ("vitoria", "Vitória de Santo Antão", -8.1189, -35.2928, 13),
+                ("canela", "Canela", -29.3644, -50.8119, 13),
+                ("jequie", "Jequié", -13.8575, -40.0839, 13),
+                ("novo hamburgo", "Novo Hamburgo", -29.6789, -51.1306, 12.5),
+            ]
+            cur.executemany(
+                "INSERT INTO contratos (id, nome, centro_lat, centro_lon, zoom_padrao) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
+                contratos_iniciais,
+            )
+            cur.execute("DELETE FROM contratos WHERE id = 'varzea'")
+    finally:
+        conn.close()
+
+    try:
+        liberar_espaco_emergencia_db(agressivo=False)
+    except Exception:
+        pass
 
 
 def calcular_extensao_coords(coordinates: List[List[float]]) -> float:
@@ -884,6 +1000,16 @@ def importar_malha_geojson(contrato_id: str, geojson_obj: Dict[str, Any], substi
             conn.close()
 
 
+_CIDADES_MALHA_PRONTA = set()
+
+
+def invalidar_cache_malha_pronta(contrato_id: Optional[str] = None) -> None:
+    if contrato_id:
+        _CIDADES_MALHA_PRONTA.discard(str(contrato_id).lower().strip())
+    else:
+        _CIDADES_MALHA_PRONTA.clear()
+
+
 def registrar_sync_log(
     endpoint: str,
     parametros: str,
@@ -893,10 +1019,15 @@ def registrar_sync_log(
     duracao_ms: int,
     mensagem: str = "",
 ):
-    """Registra log de chamada HTTP à API Inlog mantendo os últimos 500 registros."""
+    """Registra log de chamada HTTP à API Inlog mantendo os últimos 500 registros sem sobrecarregar o disco."""
+    global _SYNC_LOG_COUNTER
+    _SYNC_LOG_COUNTER += 1
+    deve_limpar = (_SYNC_LOG_COUNTER % 100 == 0)
+
     with _write_lock:
-        conn = get_connection()
+        conn = None
         try:
+            conn = get_connection()
             with conn:
                 conn.execute(
                     """
@@ -914,18 +1045,24 @@ def registrar_sync_log(
                         (mensagem or "")[:500],
                     ),
                 )
-                conn.execute(
-                    """
-                    DELETE FROM inlog_sync_logs
-                    WHERE id NOT IN (
-                        SELECT id FROM inlog_sync_logs ORDER BY id DESC LIMIT 500
+                if deve_limpar:
+                    conn.execute(
+                        """
+                        DELETE FROM inlog_sync_logs
+                        WHERE id NOT IN (
+                            SELECT id FROM inlog_sync_logs ORDER BY id DESC LIMIT 300
+                        )
+                        """
                     )
-                    """
-                )
         except Exception as e:
-            print(f"[DB LOG] Erro ao gravar sync log: {e}")
+            if eh_erro_disco_cheio(e):
+                try:
+                    liberar_espaco_emergencia_db(agressivo=True)
+                except Exception:
+                    pass
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def importar_malha_cidade_se_necessario(contrato_id: str) -> int:
@@ -938,19 +1075,26 @@ def importar_malha_cidade_se_necessario(contrato_id: str) -> int:
     if not contrato_id:
         return 0
 
+    if contrato_id in _CIDADES_MALHA_PRONTA:
+        return 1
+
     try:
         import malha_rotas
         if malha_rotas.arquivo_malha(contrato_id):
             if malha_rotas.projeto_precisa_construir(contrato_id):
                 res = malha_rotas.construir_projeto_cidade(contrato_id)
                 if res.get("ok"):
-                    return int(res.get("n_segmentos") or 0)
+                    n_seg = int(res.get("n_segmentos") or 0)
+                    if n_seg > 0:
+                        _CIDADES_MALHA_PRONTA.add(contrato_id)
+                    return n_seg
             conn = get_connection()
             try:
                 total = conn.execute(
                     "SELECT COUNT(*) FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,)
                 ).fetchone()[0]
                 if total > 0:
+                    _CIDADES_MALHA_PRONTA.add(contrato_id)
                     return total
             finally:
                 conn.close()
@@ -958,72 +1102,72 @@ def importar_malha_cidade_se_necessario(contrato_id: str) -> int:
         print(f"[DB] Aviso ao construir projeto via malha_rotas para {contrato_id}: {e}")
 
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,))
-    total = cur.fetchone()[0]
-    if total > 0:
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM segmentos_viarios WHERE contrato_id = ?", (contrato_id,))
+        total = cur.fetchone()[0]
+        if total > 0:
+            _CIDADES_MALHA_PRONTA.add(contrato_id)
+            return total
+
+        pasta_5 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "5"))
+        mapa_arquivos = {
+            "jaboatao": "Jaboatao_dia-05.11.2026.html",
+            "cabo": "Cabo_dia-05.11.2026.html",
+            "olinda": "Olinda_dia-05.11.2026.html",
+            "paulista": "Paulista_dia-05.11.2026.html",
+            "caruaru": "Caruaru_dia-05.11.2026.html",
+            "cuiaba": "Cuiaba_dia-05.11.2026.html",
+            "garanhuns": "Garanhuns_dia-05.11.2026.html",
+            "pesqueira": "Pesqueira_dia-05.11.2026.html",
+            "vitoria": "Vitoria_dia-05.11.2026.html",
+            "canela": "Canela_dia-05.11.2026.html",
+            "jequie": "Jequie_dia-05.11.2026.html",
+            "novo hamburgo": "Novo hamburgo_dia-05.11.2026.html",
+        }
+
+        arquivo_nome = mapa_arquivos.get(contrato_id.lower())
+        if not arquivo_nome:
+            return 0
+
+        caminho = os.path.join(pasta_5, arquivo_nome)
+        if not os.path.exists(caminho):
+            return 0
+
+        with open(caminho, "r", encoding="utf-8", errors="ignore") as f:
+            texto = f.read()
+
+        m = re.search(r"window\.SEGMENTS\s*=\s*(\{.*?\});", texto)
+        if not m:
+            return 0
+
+        data = json.loads(m.group(1))
+        features = data.get("features", [])
+
+        registros = []
+        for f in features:
+            props = f.get("properties", {})
+            geom = f.get("geometry", {})
+            fid = props.get("fid", 0)
+            rua = props.get("street_name") or "Via Sem Nome"
+            setor = props.get("sector") or props.get("sector_key") or "S/S"
+            extensao = float(props.get("len_m", 50.0))
+            geom_str = json.dumps(geom.get("coordinates", []))
+            registros.append((contrato_id, fid, rua, setor, extensao, geom_str))
+
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO segmentos_viarios (contrato_id, fid, nome_rua, setor, extensao_m, geom_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                registros,
+            )
+        if registros:
+            _CIDADES_MALHA_PRONTA.add(contrato_id)
+        return len(registros)
+    finally:
         conn.close()
-        return total
-
-    pasta_5 = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "5"))
-    mapa_arquivos = {
-        "jaboatao": "Jaboatao_dia-05.11.2026.html",
-        "cabo": "Cabo_dia-05.11.2026.html",
-        "olinda": "Olinda_dia-05.11.2026.html",
-        "paulista": "Paulista_dia-05.11.2026.html",
-        "caruaru": "Caruaru_dia-05.11.2026.html",
-        "cuiaba": "Cuiaba_dia-05.11.2026.html",
-        "garanhuns": "Garanhuns_dia-05.11.2026.html",
-        "pesqueira": "Pesqueira_dia-05.11.2026.html",
-        "vitoria": "Vitoria_dia-05.11.2026.html",
-        "canela": "Canela_dia-05.11.2026.html",
-        "jequie": "Jequie_dia-05.11.2026.html",
-        "novo hamburgo": "Novo hamburgo_dia-05.11.2026.html",
-    }
-
-    arquivo_nome = mapa_arquivos.get(contrato_id.lower())
-    if not arquivo_nome:
-        conn.close()
-        return 0
-
-    caminho = os.path.join(pasta_5, arquivo_nome)
-    if not os.path.exists(caminho):
-        conn.close()
-        return 0
-
-    with open(caminho, "r", encoding="utf-8", errors="ignore") as f:
-        texto = f.read()
-
-    m = re.search(r"window\.SEGMENTS\s*=\s*(\{.*?\});", texto)
-    if not m:
-        conn.close()
-        return 0
-
-    data = json.loads(m.group(1))
-    features = data.get("features", [])
-
-    registros = []
-    for f in features:
-        props = f.get("properties", {})
-        geom = f.get("geometry", {})
-        fid = props.get("fid", 0)
-        rua = props.get("street_name") or "Via Sem Nome"
-        setor = props.get("sector") or props.get("sector_key") or "S/S"
-        extensao = float(props.get("len_m", 50.0))
-        geom_str = json.dumps(geom.get("coordinates", []))
-        registros.append((contrato_id, fid, rua, setor, extensao, geom_str))
-
-    with conn:
-        conn.executemany(
-            """
-            INSERT INTO segmentos_viarios (contrato_id, fid, nome_rua, setor, extensao_m, geom_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            registros,
-        )
-
-    conn.close()
-    return len(registros)
 
 
 # Inicializa banco na importação do módulo
