@@ -62,7 +62,7 @@ def _resolver_db_path() -> str:
 
 
 DB_PATH = _resolver_db_path()
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
 
 
 def _normalize_pg_val(val: Any) -> Any:
@@ -246,7 +246,7 @@ def _get_pg_pool():
         raise RuntimeError("DATABASE_URL aponta para PostgreSQL, mas 'psycopg' não está instalado.")
     with _PG_POOL_LOCK:
         if _PG_POOL is None and ConnectionPool is not None:
-            _PG_POOL = ConnectionPool(DATABASE_URL, min_size=1, max_size=12, open=True)
+            _PG_POOL = ConnectionPool(DATABASE_URL, min_size=1, max_size=24, timeout=15.0, open=True)
     return _PG_POOL
 
 
