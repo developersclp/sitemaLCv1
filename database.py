@@ -14,14 +14,32 @@ import json
 import math
 import re
 import threading
+from datetime import datetime, date
 from typing import Dict, List, Optional, Any
+
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
+
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:
+    ConnectionPool = None
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _SEED_DB_PATH = os.path.join(_BASE_DIR, "locar.db")
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_POSTGRES = DATABASE_URL.lower().startswith(("postgres://", "postgresql://"))
+_PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
+
 
 def _resolver_db_path() -> str:
     """Resolve o caminho do banco SQLite (suporta Railway Volume e DATABASE_PATH)."""
+    if IS_POSTGRES:
+        return "postgresql"
     env_db = os.getenv("DATABASE_PATH", "").strip()
     vol_dir = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
     if env_db:
@@ -47,8 +65,201 @@ DB_PATH = _resolver_db_path()
 _write_lock = threading.Lock()
 
 
-def get_connection() -> sqlite3.Connection:
-    """Cria conexão com o SQLite configurada para alta velocidade e concorrência."""
+def _normalize_pg_val(val: Any) -> Any:
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(val, date):
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, memoryview):
+        return bytes(val)
+    return val
+
+
+class _PgRow:
+    """Row compatível com sqlite3.Row (suporta row['col'], row[0], dict(row), dict(fetchall()))."""
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = tuple(cols)
+        norm_vals = tuple(_normalize_pg_val(v) for v in vals)
+        self._vals = norm_vals
+        self._map = dict(zip(self._cols, norm_vals))
+
+    def keys(self):
+        return list(self._cols)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._vals[key]
+        return self._map[key]
+
+    def get(self, key, default=None):
+        return self._map.get(key, default)
+
+
+def _translate_sql_for_pg(sql: str):
+    """Traduz placeholders '?' e pequenos dialetos SQLite para PostgreSQL."""
+    out = []
+    in_single = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            out.append(ch)
+            if in_single and i + 1 < n and sql[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            in_single = not in_single
+        elif ch == "?" and not in_single:
+            out.append("%s")
+        else:
+            out.append(ch)
+        i += 1
+
+    pg_sql = "".join(out).strip()
+    if re.match(r"^INSERT\s+OR\s+IGNORE\s+INTO\b", pg_sql, flags=re.IGNORECASE):
+        pg_sql = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", pg_sql, count=1, flags=re.IGNORECASE)
+        if "ON CONFLICT" not in pg_sql.upper():
+            pg_sql = pg_sql.rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    has_returning = False
+    m_ins = re.match(r"^INSERT\s+INTO\s+([a-zA-Z0-9_]+)\b", pg_sql, flags=re.IGNORECASE)
+    if m_ins:
+        tbl = m_ins.group(1).lower()
+        if tbl in ("segmentos_viarios", "auditorias", "inlog_alarmes", "inlog_falhas", "inlog_sync_logs", "segmentos_viarios_legado"):
+            if "RETURNING" not in pg_sql.upper() and "ON CONFLICT DO NOTHING" not in pg_sql.upper():
+                pg_sql = pg_sql.rstrip(";") + " RETURNING id"
+                has_returning = True
+    return pg_sql, has_returning
+
+
+class _PgCursor:
+    def __init__(self, raw_cur):
+        self._cur = raw_cur
+        self.lastrowid = None
+        self.rowcount = 0
+
+    def _wrap_row(self, row):
+        if row is None or not self._cur.description:
+            return row
+        cols = [d.name for d in self._cur.description]
+        return _PgRow(cols, row)
+
+    def execute(self, sql: str, params: Any = ()):
+        pg_sql, has_returning = _translate_sql_for_pg(sql)
+        self._cur.execute(pg_sql, params or ())
+        self.rowcount = self._cur.rowcount
+        if has_returning and self._cur.description:
+            r = self._cur.fetchone()
+            self.lastrowid = r[0] if r else None
+        return self
+
+    def executemany(self, sql: str, seq_of_params):
+        pg_sql, _ = _translate_sql_for_pg(sql)
+        # Remove RETURNING em executemany em lote
+        pg_sql = re.sub(r"\s+RETURNING\s+id\s*$", "", pg_sql, flags=re.IGNORECASE)
+        self._cur.executemany(pg_sql, seq_of_params)
+        self.rowcount = self._cur.rowcount
+        return self
+
+    def fetchone(self):
+        return self._wrap_row(self._cur.fetchone())
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        if not rows or not self._cur.description:
+            return rows
+        cols = [d.name for d in self._cur.description]
+        return [_PgRow(cols, r) for r in rows]
+
+    def close(self):
+        self._cur.close()
+
+
+class _PgConnection:
+    """Wrapper sobre psycopg.Connection compatível com a API do sqlite3.Connection."""
+    def __init__(self, raw_conn, pool=None):
+        self._conn = raw_conn
+        self._pool = pool
+        self._closed = False
+
+    def cursor(self) -> _PgCursor:
+        return _PgCursor(self._conn.cursor())
+
+    def execute(self, sql: str, params: Any = ()) -> _PgCursor:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql: str, seq_of_params) -> _PgCursor:
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if not self._conn.autocommit:
+                self._conn.commit()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        if self._pool is not None:
+            self._pool.putconn(self._conn)
+        else:
+            self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+        return False
+
+
+def _get_pg_pool():
+    global _PG_POOL
+    if _PG_POOL is not None:
+        return _PG_POOL
+    if psycopg is None:
+        raise RuntimeError("DATABASE_URL aponta para PostgreSQL, mas 'psycopg' não está instalado.")
+    with _PG_POOL_LOCK:
+        if _PG_POOL is None and ConnectionPool is not None:
+            _PG_POOL = ConnectionPool(DATABASE_URL, min_size=1, max_size=12, open=True)
+    return _PG_POOL
+
+
+def get_connection():
+    """Cria conexão com SQLite (local) ou PostgreSQL (Railway DATABASE_URL)."""
+    if IS_POSTGRES:
+        pool = _get_pg_pool()
+        if pool is not None:
+            raw_conn = pool.getconn()
+            return _PgConnection(raw_conn, pool=pool)
+        raw_conn = psycopg.connect(DATABASE_URL)
+        return _PgConnection(raw_conn, pool=None)
+
     db_file = _resolver_db_path()
     conn = sqlite3.connect(db_file, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -61,10 +272,10 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db():
-    """Cria as tabelas, colunas de migração e índices se não existirem."""
+    """Cria as tabelas, colunas de migração e índices se não existirem (SQLite e PostgreSQL)."""
     conn = get_connection()
     with conn:
-        conn.executescript("""
+        ddl_script = """
             CREATE TABLE IF NOT EXISTS contratos (
                 id TEXT PRIMARY KEY,
                 nome TEXT NOT NULL,
@@ -345,12 +556,62 @@ def init_db():
                 atualizado_em TIMESTAMP,
                 arquivado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
+
+            CREATE TABLE IF NOT EXISTS links_snapshot (
+                id TEXT PRIMARY KEY,
+                chave_params TEXT NOT NULL,
+                contrato_id TEXT NOT NULL,
+                data_iso TEXT NOT NULL,
+                periodo TEXT NOT NULL DEFAULT 'diario',
+                parametros_json TEXT NOT NULL,
+                payload_gzip BLOB NOT NULL,
+                csv_gzip BLOB,
+                csv_filename TEXT,
+                sha256 TEXT NOT NULL,
+                tamanho_raw INTEGER DEFAULT 0,
+                tamanho_gzip INTEGER DEFAULT 0,
+                janela_fechada INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                expira_em TEXT,
+                revogado INTEGER DEFAULT 0,
+                acessos INTEGER DEFAULT 0,
+                ultimo_acesso TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_snap_chave ON links_snapshot(chave_params);
+            CREATE INDEX IF NOT EXISTS idx_snap_contrato ON links_snapshot(contrato_id, data_iso);
+
+            CREATE TABLE IF NOT EXISTS engine_meta (
+                chave TEXT PRIMARY KEY,
+                valor TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS inlog_gps_janelas (
+                placa TEXT NOT NULL,
+                data_iso TEXT NOT NULL,
+                fetch_ate TEXT NOT NULL,
+                PRIMARY KEY (placa, data_iso)
+            );
+
+            CREATE TABLE IF NOT EXISTS auditorias_periodo_cache (
+                chave TEXT PRIMARY KEY,
+                criado_em TEXT,
+                payload_json TEXT
+            );
+        """
+
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            ddl_pg = ddl_script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            ddl_pg = re.sub(r"\bBLOB\b", "BYTEA", ddl_pg)
+            for stmt in ddl_pg.split(";"):
+                s = stmt.strip()
+                if s:
+                    cur.execute(s)
+        else:
+            conn.executescript(ddl_script)
 
         # Migração segura de colunas extras em segmentos_viarios (caso banco antigo)
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(segmentos_viarios)")
-        colunas_existentes = {row["name"] for row in cur.fetchall()}
         migracoes = [
             ("tipo", "TEXT DEFAULT 'COLETA'"),
             ("is_manual", "INTEGER DEFAULT 0"),
@@ -361,12 +622,18 @@ def init_db():
             ("origem", "TEXT DEFAULT 'LEGADO'"),
             ("bairro", "TEXT"),
         ]
-        for col_name, col_def in migracoes:
-            if col_name not in colunas_existentes:
-                cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN {col_name} {col_def}")
+        if IS_POSTGRES:
+            for col_name, col_def in migracoes:
+                cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+        else:
+            cur.execute("PRAGMA table_info(segmentos_viarios)")
+            colunas_existentes = {row["name"] for row in cur.fetchall()}
+            for col_name, col_def in migracoes:
+                if col_name not in colunas_existentes:
+                    cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN {col_name} {col_def}")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_seg_edge_key ON segmentos_viarios(contrato_id, edge_key)")
 
-        # Popula contratos padrão com INSERT OR IGNORE
+        # Popula contratos padrão com ON CONFLICT DO NOTHING (padrão SQLite + PostgreSQL)
         contratos_iniciais = [
             ("jaboatao", "Jaboatão dos Guararapes", -8.1930, -34.9364, 12),
             ("cabo", "Cabo de Santo Agostinho", -8.2833, -35.0333, 12),
@@ -382,7 +649,7 @@ def init_db():
             ("novo hamburgo", "Novo Hamburgo", -29.6789, -51.1306, 12.5),
         ]
         cur.executemany(
-            "INSERT OR IGNORE INTO contratos (id, nome, centro_lat, centro_lon, zoom_padrao) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO contratos (id, nome, centro_lat, centro_lon, zoom_padrao) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING",
             contratos_iniciais,
         )
         cur.execute("DELETE FROM contratos WHERE id = 'varzea'")

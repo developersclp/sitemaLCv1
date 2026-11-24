@@ -276,7 +276,7 @@ class InlogService:
                     if atual and atual["fetch_ate"] and str(atual["fetch_ate"]) > novo:
                         novo = str(atual["fetch_ate"])
                     conn.execute(
-                        "INSERT OR REPLACE INTO inlog_gps_janelas (placa, data_iso, fetch_ate) VALUES (?, ?, ?)",
+                        "INSERT INTO inlog_gps_janelas (placa, data_iso, fetch_ate) VALUES (?, ?, ?) ON CONFLICT (placa, data_iso) DO UPDATE SET fetch_ate = excluded.fetch_ate",
                         (placa_chave, data_iso, novo),
                     )
             finally:
@@ -528,12 +528,31 @@ class InlogService:
                 with conn:
                     conn.executemany(
                         """
-                        INSERT OR REPLACE INTO inlog_veiculos_tempo_real (
+                        INSERT INTO inlog_veiculos_tempo_real (
                             placa, identificador, tipo_veiculo, descricao_veiculo, matricula_motorista,
                             numero_serie_rastreador, status_conexao_avl, status_ignicao, data_hora_atualizacao,
                             velocidade, sensor1, sensor2, sensor3, latitude, longitude,
                             operacoes_json, grupos_controle_json, contrato_id, atualizado_em
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT (placa) DO UPDATE SET
+                            identificador = excluded.identificador,
+                            tipo_veiculo = excluded.tipo_veiculo,
+                            descricao_veiculo = excluded.descricao_veiculo,
+                            matricula_motorista = excluded.matricula_motorista,
+                            numero_serie_rastreador = excluded.numero_serie_rastreador,
+                            status_conexao_avl = excluded.status_conexao_avl,
+                            status_ignicao = excluded.status_ignicao,
+                            data_hora_atualizacao = excluded.data_hora_atualizacao,
+                            velocidade = excluded.velocidade,
+                            sensor1 = excluded.sensor1,
+                            sensor2 = excluded.sensor2,
+                            sensor3 = excluded.sensor3,
+                            latitude = excluded.latitude,
+                            longitude = excluded.longitude,
+                            operacoes_json = excluded.operacoes_json,
+                            grupos_controle_json = excluded.grupos_controle_json,
+                            contrato_id = excluded.contrato_id,
+                            atualizado_em = CURRENT_TIMESTAMP
                         """,
                         registros,
                     )
@@ -677,12 +696,27 @@ class InlogService:
                 with conn:
                     conn.executemany(
                         """
-                        INSERT OR REPLACE INTO inlog_setores_tempo_real (
+                        INSERT INTO inlog_setores_tempo_real (
                             macro_setor, setor, identificador_veiculo, placa_veiculo,
                             percentual_conclusao, percentual_ocupacao, data_hora_inicio,
                             controle, turno, status_atividade, situacao, logradouro,
                             motorista, velocidade, status_ignicao, contrato_id, atualizado_em
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT (macro_setor, setor, turno) DO UPDATE SET
+                            identificador_veiculo = excluded.identificador_veiculo,
+                            placa_veiculo = excluded.placa_veiculo,
+                            percentual_conclusao = excluded.percentual_conclusao,
+                            percentual_ocupacao = excluded.percentual_ocupacao,
+                            data_hora_inicio = excluded.data_hora_inicio,
+                            controle = excluded.controle,
+                            status_atividade = excluded.status_atividade,
+                            situacao = excluded.situacao,
+                            logradouro = excluded.logradouro,
+                            motorista = excluded.motorista,
+                            velocidade = excluded.velocidade,
+                            status_ignicao = excluded.status_ignicao,
+                            contrato_id = excluded.contrato_id,
+                            atualizado_em = CURRENT_TIMESTAMP
                         """,
                         registros,
                     )
@@ -821,11 +855,21 @@ class InlogService:
                 with conn:
                     conn.executemany(
                         """
-                        INSERT OR REPLACE INTO inlog_relatorios_diarios (
+                        INSERT INTO inlog_relatorios_diarios (
                             data_iso, data_execucao, grupo_controle, operacao, macro_setor,
                             setor, veiculo, placa, controle, macros_json, peso_total_kg,
                             tickets_json, contrato_id
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (data_iso, placa, controle, setor) DO UPDATE SET
+                            data_execucao = excluded.data_execucao,
+                            grupo_controle = excluded.grupo_controle,
+                            operacao = excluded.operacao,
+                            macro_setor = excluded.macro_setor,
+                            veiculo = excluded.veiculo,
+                            macros_json = excluded.macros_json,
+                            peso_total_kg = excluded.peso_total_kg,
+                            tickets_json = excluded.tickets_json,
+                            contrato_id = excluded.contrato_id
                         """,
                         registros,
                     )
@@ -910,10 +954,19 @@ class InlogService:
                         with conn:
                             conn.executemany(
                                 """
-                                INSERT OR REPLACE INTO inlog_veiculos (
+                                INSERT INTO inlog_veiculos (
                                     placa, identificador, tipo, numero_serie_rastreador,
                                     modelo, chassi, ano, fabricante, atualizado_em
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT (placa) DO UPDATE SET
+                                    identificador = excluded.identificador,
+                                    tipo = excluded.tipo,
+                                    numero_serie_rastreador = excluded.numero_serie_rastreador,
+                                    modelo = excluded.modelo,
+                                    chassi = excluded.chassi,
+                                    ano = excluded.ano,
+                                    fabricante = excluded.fabricante,
+                                    atualizado_em = CURRENT_TIMESTAMP
                                 """,
                                 registros,
                             )
@@ -995,10 +1048,19 @@ class InlogService:
                         with conn:
                             conn.executemany(
                                 """
-                                INSERT OR REPLACE INTO inlog_setores (
+                                INSERT INTO inlog_setores (
                                     identificador, descricao, apelido, tipo, grupo_setor,
                                     operacao, macro_setor, contrato_id, atualizado_em
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT (identificador) DO UPDATE SET
+                                    descricao = excluded.descricao,
+                                    apelido = excluded.apelido,
+                                    tipo = excluded.tipo,
+                                    grupo_setor = excluded.grupo_setor,
+                                    operacao = excluded.operacao,
+                                    macro_setor = excluded.macro_setor,
+                                    contrato_id = excluded.contrato_id,
+                                    atualizado_em = CURRENT_TIMESTAMP
                                 """,
                                 registros,
                             )
@@ -1070,8 +1132,11 @@ class InlogService:
                         with conn:
                             conn.executemany(
                                 """
-                                INSERT OR REPLACE INTO inlog_motoristas (matricula, nome, atualizado_em)
+                                INSERT INTO inlog_motoristas (matricula, nome, atualizado_em)
                                 VALUES (?, ?, CURRENT_TIMESTAMP)
+                                ON CONFLICT (matricula) DO UPDATE SET
+                                    nome = excluded.nome,
+                                    atualizado_em = CURRENT_TIMESTAMP
                                 """,
                                 registros,
                             )
@@ -1157,11 +1222,27 @@ class InlogService:
                             with conn:
                                 conn.executemany(
                                     """
-                                    INSERT OR REPLACE INTO inlog_alarmes (
+                                    INSERT INTO inlog_alarmes (
                                         data_iso, placa, identificador, tipo, descricao, codigo_alarme,
                                         motorista, matricula_motorista, unidade, operacao, data_hora_inicio,
                                         data_hora_fim, duracao, latitude, longitude, status, informacao, contrato_id
                                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT (placa, codigo_alarme, data_hora_inicio) DO UPDATE SET
+                                        data_iso = excluded.data_iso,
+                                        identificador = excluded.identificador,
+                                        tipo = excluded.tipo,
+                                        descricao = excluded.descricao,
+                                        motorista = excluded.motorista,
+                                        matricula_motorista = excluded.matricula_motorista,
+                                        unidade = excluded.unidade,
+                                        operacao = excluded.operacao,
+                                        data_hora_fim = excluded.data_hora_fim,
+                                        duracao = excluded.duracao,
+                                        latitude = excluded.latitude,
+                                        longitude = excluded.longitude,
+                                        status = excluded.status,
+                                        informacao = excluded.informacao,
+                                        contrato_id = excluded.contrato_id
                                     """,
                                     registros,
                                 )
@@ -1381,11 +1462,12 @@ class InlogService:
                 with conn:
                     conn.executemany(
                         """
-                        INSERT OR IGNORE INTO inlog_historico_gps (
+                        INSERT INTO inlog_historico_gps (
                             placa, identificador, data_iso, data_hora, latitude, longitude,
                             velocidade, hodometro, horimetro, consumo, operacao,
                             motorista, matricula_motorista, unidade
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (placa, data_hora) DO NOTHING
                         """,
                         registros,
                     )
@@ -1530,12 +1612,30 @@ class InlogService:
                             with conn:
                                 conn.executemany(
                                     """
-                                    INSERT OR REPLACE INTO inlog_falhas (
+                                    INSERT INTO inlog_falhas (
                                         data_iso, placa, identificador, tipo, descricao, codigo_falha,
                                         motorista, matricula_motorista, unidade, operacao, data_hora_inicio,
                                         data_hora_fim, duracao, latitude, longitude, codigo_falha_modulo,
                                         descricao_falha_modulo, hodometro, horimetro, contrato_id
                                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT (placa, codigo_falha, data_hora_inicio) DO UPDATE SET
+                                        data_iso = excluded.data_iso,
+                                        identificador = excluded.identificador,
+                                        tipo = excluded.tipo,
+                                        descricao = excluded.descricao,
+                                        motorista = excluded.motorista,
+                                        matricula_motorista = excluded.matricula_motorista,
+                                        unidade = excluded.unidade,
+                                        operacao = excluded.operacao,
+                                        data_hora_fim = excluded.data_hora_fim,
+                                        duracao = excluded.duracao,
+                                        latitude = excluded.latitude,
+                                        longitude = excluded.longitude,
+                                        codigo_falha_modulo = excluded.codigo_falha_modulo,
+                                        descricao_falha_modulo = excluded.descricao_falha_modulo,
+                                        hodometro = excluded.hodometro,
+                                        horimetro = excluded.horimetro,
+                                        contrato_id = excluded.contrato_id
                                     """,
                                     registros,
                                 )
@@ -1672,11 +1772,19 @@ class InlogService:
                             with conn:
                                 conn.executemany(
                                     """
-                                    INSERT OR REPLACE INTO inlog_telemetria (
+                                    INSERT INTO inlog_telemetria (
                                         data_iso, placa, identificador, data_hora, tempo_movimento,
                                         tempo_em_faixa_verde, tempo_disponivel_faixa_verde,
                                         tempo_total_agrupador, extras_json
                                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT (placa, data_hora) DO UPDATE SET
+                                        data_iso = excluded.data_iso,
+                                        identificador = excluded.identificador,
+                                        tempo_movimento = excluded.tempo_movimento,
+                                        tempo_em_faixa_verde = excluded.tempo_em_faixa_verde,
+                                        tempo_disponivel_faixa_verde = excluded.tempo_disponivel_faixa_verde,
+                                        tempo_total_agrupador = excluded.tempo_total_agrupador,
+                                        extras_json = excluded.extras_json
                                     """,
                                     registros,
                                 )

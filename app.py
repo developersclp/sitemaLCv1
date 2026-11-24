@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional
 
 import database as db
 import malha_rotas
+import snapshots
 from inlog_service import InlogService, formatar_placa_hifen, identificar_contrato
 from engine import HeatmapEngine
 
@@ -176,7 +177,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <title>LOCAR - Mapa de Execução · Inlog, Auditoria & GIS</title>
     <!-- __SHARED_LOCK_INIT__ -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1592,11 +1593,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     <div id="modalShareSetoresResumo" class="share-sectors-summary">Todos os setores</div>
                 </div>
                 <div class="sidebar-field" style="margin-top:12px;">
-                    <label>Link Seguro Gerado:</label>
+                    <label>Link Rápido (Snapshot Congelado):</label>
                     <div class="share-input-group">
-                        <input type="text" id="inputGeneratedShareUrl" readonly class="share-url-input" placeholder="Gerando token assinado..." />
+                        <input type="text" id="inputGeneratedShareUrl" readonly class="share-url-input" placeholder="Gerando snapshot congelado..." />
+                        <button type="button" class="btn-outline" id="btnForcarRecriarShare" title="Recriar snapshot com dados atualizados">🔄 Atualizar</button>
                         <button type="button" class="btn-locar" id="btnCopyGeneratedUrl">📋 Copiar</button>
                     </div>
+                    <div id="shareSnapshotStatus" style="margin-top:6px; font-size:0.74rem; color:#475569;"></div>
                 </div>
             </div>
             <div class="modal-footer">
@@ -1637,6 +1640,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         let isReadOnlyMode = false;
         let isSharedLinkMode = false;
         let sharedToken = null;
+        let sharedSnapshotId = null;
+        let sharedCongeladoEm = null;
         let sharedPeriodo = 'diario';
         let showSectorLabels = true;
         let showPriorityHighlight = true;
@@ -1729,6 +1734,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             isReadOnlyMode = true;
             isSharedLinkMode = true;
             sharedToken = (lockCfg && lockCfg.token) ? lockCfg.token : null;
+            sharedSnapshotId = (lockCfg && lockCfg.snapshot_id) ? lockCfg.snapshot_id : null;
+            sharedCongeladoEm = (lockCfg && lockCfg.congelado_em) ? lockCfg.congelado_em : null;
             sharedPeriodo = (lockCfg && lockCfg.periodo) ? String(lockCfg.periodo).toLowerCase() : 'diario';
             document.body.classList.add('modo-link-compartilhado');
 
@@ -1880,12 +1887,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const data = document.getElementById('inputData').value;
 
             document.getElementById('loadingOverlay').style.display = 'flex';
-            document.getElementById('loadingText').innerText = `Sincronizando ${CIDADES_MAPA[cidade] || cidade} com a API Inlog...`;
+            document.getElementById('loadingText').innerText = sharedSnapshotId
+                ? `Carregando mapa congelado de ${CIDADES_MAPA[cidade] || cidade}...`
+                : `Sincronizando ${CIDADES_MAPA[cidade] || cidade} com a API Inlog...`;
 
             try {
-                let url = `/api/auditoria?cidade=${encodeURIComponent(cidade)}&data=${encodeURIComponent(data)}&operacao=${encodeURIComponent(operacaoApi)}&force=${forcar}&_t=${Date.now()}`;
-                if (sharedPeriodo && sharedPeriodo !== 'diario') url += `&periodo=${encodeURIComponent(sharedPeriodo)}`;
-                if (sharedToken) url += `&token=${encodeURIComponent(sharedToken)}`;
+                let url;
+                if (sharedSnapshotId) {
+                    url = `/api/snapshot/${encodeURIComponent(sharedSnapshotId)}`;
+                } else {
+                    url = `/api/auditoria?cidade=${encodeURIComponent(cidade)}&data=${encodeURIComponent(data)}&operacao=${encodeURIComponent(operacaoApi)}&force=${forcar}&_t=${Date.now()}`;
+                    if (sharedPeriodo && sharedPeriodo !== 'diario') url += `&periodo=${encodeURIComponent(sharedPeriodo)}`;
+                    if (sharedToken) url += `&token=${encodeURIComponent(sharedToken)}`;
+                }
                 const resp = await fetch(url);
                 const dataRes = await resp.json();
 
@@ -1907,7 +1921,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     if (tagEl) {
                         const dtFmt = dataRes.resumo?.data_formatada || data;
                         const perRot = dataRes.resumo?.periodo_rotulo ? `${dataRes.resumo.periodo_rotulo} · ` : '';
-                        tagEl.innerText = `· ${CIDADES_MAPA[cidade] || cidade} (${perRot}${dtFmt})`;
+                        const congStr = (sharedCongeladoEm || dataRes.resumo?.snapshot?.congelado_em || '').replace('T', ' ').slice(0, 16);
+                        const congRot = congStr ? ` · Congelado ${congStr}` : '';
+                        tagEl.innerText = `· ${CIDADES_MAPA[cidade] || cidade} (${perRot}${dtFmt})${congRot}`;
                     }
                 }
 
@@ -3526,8 +3542,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             if (lbl) lbl.innerText = ehMes ? 'Mês / Ano de Referência:' : 'Data da Operação:';
         }
 
-        async function gerarUrlShare() {
+        async function gerarUrlShare(forcar = false) {
             atualizarCamposPeriodoShare();
+            const forcarRecriar = (forcar === true);
             const base = window.location.origin;
             const cidade = document.getElementById('modalShareCidade').value;
             const periodo = document.getElementById('modalSharePeriodo')?.value || 'diario';
@@ -3541,21 +3558,43 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const setores = (selectedSectors.size > 0 && selectedSectors.size < setoresList.length)
                 ? Array.from(selectedSectors) : [];
             const inp = document.getElementById('inputGeneratedShareUrl');
+            const stEl = document.getElementById('shareSnapshotStatus');
+            const btnCopy = document.getElementById('btnCopyGeneratedUrl');
+
+            if (inp) inp.value = '';
+            if (inp) inp.placeholder = 'Gerando snapshot congelado (aguarde)...';
+            if (stEl) stEl.innerHTML = '⏳ Processando e congelando mapa sem API externa no acesso...';
+            if (btnCopy) btnCopy.disabled = true;
 
             try {
                 const resp = await fetch('/api/compartilhar/gerar', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cidade, data, periodo, turno, coleta, setores })
+                    body: JSON.stringify({ cidade, data, periodo, turno, coleta, setores, forcar: forcarRecriar })
                 });
                 const res = await resp.json();
                 if (res && res.sucesso && res.path) {
                     const url = `${base}${res.path}`;
                     if (inp) inp.value = url;
+                    if (stEl) {
+                        const kb = res.tamanho_kb ? `${res.tamanho_kb} KB` : '';
+                        const horaCong = (res.atualizado_em || '').replace('T', ' ').slice(0, 16);
+                        if (!res.janela_fechada) {
+                            stEl.innerHTML = `⚡ <b>Snapshot ${res.recriado ? 'recriado' : 'gerado'}</b> (${kb}) · 🟡 <b>Dia em andamento</b> — gere novamente ou clique em Atualizar para renovar os dados · Sem expiração`;
+                        } else if (res.reutilizado) {
+                            stEl.innerHTML = `⚡ <b>Snapshot em cache</b> (${kb}) · 🔒 Janela fechada (${horaCong}) · Sem expiração`;
+                        } else {
+                            stEl.innerHTML = `⚡ <b>Snapshot congelado</b> (${kb}) · 🔒 Janela fechada (${horaCong}) · Sem expiração`;
+                        }
+                    }
                     return url;
                 }
+                if (stEl) stEl.innerHTML = `<span style="color:#DC2626;">Erro: ${escapeHtml((res && res.erro) || 'Falha ao gerar snapshot.')}</span>`;
             } catch (e) {
-                console.error('Erro ao gerar token seguro:', e);
+                console.error('Erro ao gerar snapshot:', e);
+                if (stEl) stEl.innerHTML = '<span style="color:#DC2626;">Erro de comunicação ao gerar snapshot.</span>';
+            } finally {
+                if (btnCopy) btnCopy.disabled = false;
             }
             return '';
         }
@@ -3590,6 +3629,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         function baixarCsvAuditoria() {
+            if (sharedSnapshotId) {
+                window.location.href = `/api/snapshot/${encodeURIComponent(sharedSnapshotId)}/csv`;
+                return;
+            }
             if (!currentAudit || !currentAudit.resumo) {
                 return mostrarToast('Nenhuma auditoria disponível para exportar CSV.');
             }
@@ -3748,19 +3791,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('btnCloseModalShare').addEventListener('click', () => document.getElementById('modalShareLink').style.display = 'none');
         document.getElementById('btnCancelShareModal').addEventListener('click', () => document.getElementById('modalShareLink').style.display = 'none');
         ['modalShareCidade','modalShareData','modalShareMes','modalSharePeriodo','modalShareTurno','modalShareColeta'].forEach(id => {
-            document.getElementById(id)?.addEventListener('change', gerarUrlShare);
+            document.getElementById(id)?.addEventListener('change', () => gerarUrlShare(false));
         });
+        document.getElementById('btnForcarRecriarShare')?.addEventListener('click', () => gerarUrlShare(true));
         document.getElementById('btnCopyGeneratedUrl').addEventListener('click', async () => {
             let url = document.getElementById('inputGeneratedShareUrl').value;
-            if (!url) url = await gerarUrlShare();
+            if (!url) url = await gerarUrlShare(false);
             if (!url) return;
-            navigator.clipboard.writeText(url).then(() => mostrarToast('Link seguro copiado!')).catch(() => {
+            navigator.clipboard.writeText(url).then(() => mostrarToast('Link rápido copiado!')).catch(() => {
                 const inp = document.getElementById('inputGeneratedShareUrl'); inp.select(); document.execCommand('copy');
-                mostrarToast('Link seguro copiado!');
+                mostrarToast('Link rápido copiado!');
             });
         });
         document.getElementById('btnTestOpenShareUrl').addEventListener('click', async () => {
-            const url = await gerarUrlShare();
+            let url = document.getElementById('inputGeneratedShareUrl').value;
+            if (!url) url = await gerarUrlShare(false);
             if (url) window.open(url, '_blank');
         });
 
@@ -3829,12 +3874,15 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             headers.update(extra_headers)
         self._send_bytes(raw, "application/json; charset=utf-8", status=status, extra_headers=headers)
 
-    def _send_html(self, html_bytes: bytes, status: int = 200, cookies_out: Optional[list] = None):
+    def _send_html(self, html_bytes: bytes, status: int = 200, cookies_out: Optional[list] = None, extra_headers: Optional[Dict[str, str]] = None):
+        hdrs = {"Pragma": "no-cache", "Expires": "0"}
+        if extra_headers:
+            hdrs.update(extra_headers)
         self._send_bytes(
             html_bytes,
             "text/html; charset=utf-8",
             status=status,
-            extra_headers={"Pragma": "no-cache", "Expires": "0"},
+            extra_headers=hdrs,
             cookies_out=cookies_out,
         )
 
@@ -3868,8 +3916,19 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
         cookies = self._obter_cookies()
         is_admin = validar_cookie_admin(cookies.get("lc_admin_auth"))
         lock_token = cookies.get("lc_viewer_lock")
-        viewer_lock = validar_token_compartilhamento(lock_token) if lock_token else None
+        viewer_lock = None
+        if lock_token:
+            if "." in lock_token:
+                viewer_lock = validar_token_compartilhamento(lock_token)
+            else:
+                snap_meta = snapshots.obter_snapshot_meta(lock_token)
+                if snap_meta:
+                    viewer_lock = {"snapshot_id": snap_meta["id"], **snap_meta["params"]}
         return is_admin, viewer_lock, lock_token
+
+    def _is_https_request(self) -> bool:
+        proto = self.headers.get("X-Forwarded-Proto", "").lower()
+        return proto == "https"
 
     def _render_html_com_lock(self, shared_lock: Dict[str, Any]) -> bytes:
         script_tag = f"<script>window.__SHARED_LOCK__ = {json.dumps(shared_lock, ensure_ascii=False)};</script>"
@@ -3884,43 +3943,165 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
 
-        if path == "/static/logo-locar.png":
-            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo-locar.png")
-            if os.path.isfile(logo_path):
-                with open(logo_path, "rb") as f_img:
-                    img_bytes = f_img.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+        if path.startswith("/static/"):
+            static_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
+            rel_path = urllib.parse.unquote(path[len("/static/"):]).lstrip("/\\")
+            alvo_path = os.path.abspath(os.path.join(static_root, rel_path))
+            if (alvo_path == static_root or alvo_path.startswith(static_root + os.sep)) and os.path.isfile(alvo_path):
+                ext = os.path.splitext(alvo_path)[1].lower()
+                ctype_map = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".svg": "image/svg+xml",
+                    ".css": "text/css; charset=utf-8",
+                    ".js": "application/javascript; charset=utf-8",
+                    ".woff2": "font/woff2",
+                    ".json": "application/json; charset=utf-8",
+                }
+                ctype = ctype_map.get(ext, "application/octet-stream")
+                with open(alvo_path, "rb") as f_st:
+                    st_bytes = f_st.read()
+                if ext in (".css", ".js", ".svg", ".json") and "gzip" in self.headers.get("Accept-Encoding", "").lower() and len(st_bytes) > 1024:
+                    st_bytes = gzip.compress(st_bytes, compresslevel=5)
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
                 self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Content-Length", str(len(st_bytes)))
                 self.end_headers()
-                self.wfile.write(img_bytes)
+                self.wfile.write(st_bytes)
             else:
                 self.send_error(404)
             return
 
         is_admin, viewer_lock, lock_token_raw = self._obter_sessao()
 
-        # 0. Rota Exclusiva do Link Assinado Compartilhado (/v/<token>)
+        # 0. Rota Exclusiva do Link Compartilhado (/v/<snapshot_id> ou legado /v/<token>)
         if path.startswith("/v/"):
-            token = urllib.parse.unquote(path[3:].strip("/"))
-            payload = validar_token_compartilhamento(token)
-            if not payload:
-                erro_html = (
-                    "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'/>"
-                    "<title>Link Inválido - LOCAR</title></head>"
-                    "<body style='font-family:Inter,sans-serif;background:#F8FAFC;display:flex;align-items:center;justify-content:center;height:100vh;'>"
-                    "<div style='background:#fff;padding:28px 34px;border-radius:10px;border-top:4px solid #E53935;box-shadow:0 8px 24px rgba(0,0,0,0.08);text-align:center;max-width:420px;'>"
-                    "<h2 style='margin:0 0 8px;color:#1E293B;'>🔒 Link de Visualização Inválido</h2>"
-                    "<p style='margin:0;color:#64748B;font-size:14px;'>Este link foi adulterado ou não é válido. Solicite um novo link oficial à equipe Locar.</p>"
-                    "</div></body></html>"
-                ).encode("utf-8")
-                self._send_html(erro_html, status=403)
+            token_ou_id = urllib.parse.unquote(path[3:].strip("/"))
+            sec_headers = {
+                "X-Robots-Tag": "noindex, nofollow",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            }
+            secure_attr = "; Secure" if self._is_https_request() else ""
+
+            if "." in token_ou_id:
+                payload = validar_token_compartilhamento(token_ou_id)
+                if not payload:
+                    erro_html = (
+                        "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'/>"
+                        "<title>Link Inválido - LOCAR</title></head>"
+                        "<body style='font-family:Inter,sans-serif;background:#F8FAFC;display:flex;align-items:center;justify-content:center;height:100vh;'>"
+                        "<div style='background:#fff;padding:28px 34px;border-radius:10px;border-top:4px solid #E53935;box-shadow:0 8px 24px rgba(0,0,0,0.08);text-align:center;max-width:420px;'>"
+                        "<h2 style='margin:0 0 8px;color:#1E293B;'>🔒 Link de Visualização Inválido</h2>"
+                        "<p style='margin:0;color:#64748B;font-size:14px;'>Este link foi adulterado ou não é válido. Solicite um novo link oficial à equipe Locar.</p>"
+                        "</div></body></html>"
+                    ).encode("utf-8")
+                    self._send_html(erro_html, status=403, extra_headers=sec_headers)
+                    return
+
+                lock_cfg = {"active": True, "token": token_ou_id, **payload}
+                cookie_header = f"lc_viewer_lock={token_ou_id}; Path=/; HttpOnly; SameSite=Lax{secure_attr}"
+                self._send_html(self._render_html_com_lock(lock_cfg), cookies_out=[cookie_header], extra_headers=sec_headers)
                 return
 
-            lock_cfg = {"active": True, "token": token, **payload}
-            cookie_header = f"lc_viewer_lock={token}; Path=/; HttpOnly; SameSite=Lax"
-            self._send_html(self._render_html_com_lock(lock_cfg), cookies_out=[cookie_header])
+            snap_meta = snapshots.obter_snapshot_meta(token_ou_id)
+            if not snap_meta:
+                erro_html = (
+                    "<!DOCTYPE html><html lang='pt-BR'><head><meta charset='utf-8'/>"
+                    "<title>Link Indisponível - LOCAR</title></head>"
+                    "<body style='font-family:Inter,sans-serif;background:#F8FAFC;display:flex;align-items:center;justify-content:center;height:100vh;'>"
+                    "<div style='background:#fff;padding:28px 34px;border-radius:10px;border-top:4px solid #E53935;box-shadow:0 8px 24px rgba(0,0,0,0.08);text-align:center;max-width:420px;'>"
+                    "<h2 style='margin:0 0 8px;color:#1E293B;'>🔒 Link Indisponível</h2>"
+                    "<p style='margin:0;color:#64748B;font-size:14px;'>Este link não existe, expirou ou foi revogado pela equipe Locar.</p>"
+                    "</div></body></html>"
+                ).encode("utf-8")
+                self._send_html(erro_html, status=404, extra_headers=sec_headers)
+                return
+
+            lock_cfg = {
+                "active": True,
+                "snapshot_id": snap_meta["id"],
+                "congelado_em": snap_meta["atualizado_em"],
+                "janela_fechada": snap_meta["janela_fechada"],
+                **snap_meta["params"],
+            }
+            cookie_header = f"lc_viewer_lock={snap_meta['id']}; Path=/; HttpOnly; SameSite=Lax{secure_attr}"
+            self._send_html(self._render_html_com_lock(lock_cfg), cookies_out=[cookie_header], extra_headers=sec_headers)
             return
+
+        # 0a. Servir Snapshot Congelado (zero API Inlog, zero engine, GZIP pré-comprimido)
+        if path.startswith("/api/snapshot/"):
+            sub_parts = path[len("/api/snapshot/"):].strip("/").split("/")
+            snap_id = urllib.parse.unquote(sub_parts[0]) if sub_parts else ""
+            if len(sub_parts) == 2 and sub_parts[1] == "csv":
+                csv_res = snapshots.obter_snapshot_csv(snap_id)
+                if not csv_res:
+                    self._send_json({"erro": "CSV do snapshot não encontrado ou revogado."}, status=404)
+                    return
+                csv_gz, csv_filename = csv_res
+                accept_enc = self.headers.get("Accept-Encoding", "").lower()
+                if "gzip" in accept_enc:
+                    body_csv = csv_gz
+                    usar_gz = True
+                else:
+                    body_csv = gzip.decompress(csv_gz)
+                    usar_gz = False
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8-sig")
+                self.send_header("Content-Disposition", f'attachment; filename="{csv_filename}"')
+                self.send_header("Cache-Control", "private, no-cache")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if usar_gz:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                self.send_header("Content-Length", str(len(body_csv)))
+                self.end_headers()
+                self.wfile.write(body_csv)
+                return
+
+            if len(sub_parts) == 1 and snap_id:
+                snap = snapshots.obter_snapshot_payload(snap_id)
+                if not snap:
+                    self._send_json({"erro": "Snapshot não encontrado ou revogado."}, status=404)
+                    return
+                etag = f'"{snap["sha256"]}"'
+                if_none_match = self.headers.get("If-None-Match", "").strip()
+                if if_none_match == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "private, no-cache")
+                    self.end_headers()
+                    return
+
+                accept_enc = self.headers.get("Accept-Encoding", "").lower()
+                if "gzip" in accept_enc:
+                    body_snap = snap["payload_gzip"]
+                    usar_gz = True
+                else:
+                    body_snap = gzip.decompress(snap["payload_gzip"])
+                    usar_gz = False
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, no-cache")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if usar_gz:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                self.send_header("Content-Length", str(len(body_snap)))
+                self.end_headers()
+                self.wfile.write(body_snap)
+                return
 
         # 0b. Login Administrativo / Desbloqueio do Painel Central
         if path == "/login":
@@ -4022,6 +4203,12 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
         # Demais APIs internas e Inlog: exigem sessão administrativa autenticada
         if path.startswith("/api/") and (not is_admin) and (viewer_lock is not None or REQUIRE_ADMIN_LOGIN):
             self._send_json({"sucesso": False, "erro": "Acesso restrito ao Painel Central autenticado."}, status=403)
+            return
+
+        # 3b. Listar Snapshots Gerados (Painel Central)
+        if path == "/api/compartilhar/listar":
+            cid_filtro = query.get("cidade", [None])[0]
+            self._send_json({"sucesso": True, "snapshots": snapshots.listar_snapshots(contrato_id=cid_filtro)})
             return
 
         # 4. Exportação GeoJSON da Malha Viária Local
@@ -4403,11 +4590,33 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"sucesso": False, "erro": "Ação bloqueada: sessão restrita ao modo visualização."}, status=403)
             return
 
-        # 0b. Gerar Link Assinado Compartilhável (Exclusivo para Cidade Única)
+        # 0b. Gerar Link Snapshot Congelado (ou atualizar se o dia ainda estiver em andamento)
         if path == "/api/compartilhar/gerar":
             try:
-                token = gerar_token_compartilhamento(dados)
-                self._send_json({"sucesso": True, "token": token, "path": f"/v/{token}"})
+                forcar_recriar = bool(dados.get("forcar", False))
+                snap = snapshots.gerar_ou_atualizar_snapshot(engine, dados, forcar_recriar=forcar_recriar)
+                self._send_json({
+                    "sucesso": True,
+                    "modo": "snapshot",
+                    "id": snap["id"],
+                    "path": snap["path"],
+                    "reutilizado": snap["reutilizado"],
+                    "recriado": snap["recriado"],
+                    "janela_fechada": snap["janela_fechada"],
+                    "criado_em": snap["criado_em"],
+                    "atualizado_em": snap["atualizado_em"],
+                    "tamanho_kb": round((snap["tamanho_gzip"] or 0) / 1024.0, 1),
+                })
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        # 0c. Revogar Link Snapshot
+        if path == "/api/compartilhar/revogar":
+            try:
+                snap_id = str(dados.get("id") or "").strip()
+                ok = snapshots.revogar_snapshot(snap_id)
+                self._send_json({"sucesso": ok})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return
@@ -4511,7 +4720,7 @@ def run(port: int = 8080):
     print("=" * 72)
     print(" LOCAR SANEAMENTO AMBIENTAL - SISTEMA LC v1 (INLOG 100% REAL)")
     print(f" Servidor multi-thread ativo em: http://{host}:{port}")
-    print(f" Banco SQLite ativo: {db.DB_PATH}")
+    print(f" Banco ativo: {'PostgreSQL (DATABASE_URL)' if db.IS_POSTGRES else f'SQLite ({db.DB_PATH})'}")
     print("=" * 72)
     httpd.serve_forever()
 

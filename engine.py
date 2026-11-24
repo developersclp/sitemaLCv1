@@ -53,7 +53,7 @@ class HeatmapEngine:
                         conn.execute("DELETE FROM auditoria_detalhes")
                         conn.execute("DELETE FROM auditorias")
                         conn.execute(
-                            "INSERT OR REPLACE INTO engine_meta (chave, valor) VALUES ('nomenclatura_version', ?)",
+                            "INSERT INTO engine_meta (chave, valor) VALUES ('nomenclatura_version', ?) ON CONFLICT (chave) DO UPDATE SET valor = excluded.valor",
                             (NOMENCLATURA_VERSION,),
                         )
                 HeatmapEngine._cache_nomenclatura_validado = True
@@ -1872,7 +1872,7 @@ class HeatmapEngine:
                 try:
                     with conn_sv:
                         conn_sv.execute(
-                            "INSERT OR REPLACE INTO auditorias_periodo_cache (chave, criado_em, payload_json) VALUES (?, ?, ?)",
+                            "INSERT INTO auditorias_periodo_cache (chave, criado_em, payload_json) VALUES (?, ?, ?) ON CONFLICT (chave) DO UPDATE SET criado_em = excluded.criado_em, payload_json = excluded.payload_json",
                             (
                                 cache_key,
                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

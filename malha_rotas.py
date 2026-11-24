@@ -1143,10 +1143,21 @@ def _gravar_projeto(
                 km_total = round(sum(r["extensao_m"] for r in registros) / 1000.0, 2)
                 cur.execute(
                     """
-                    INSERT OR REPLACE INTO projetos_malha
+                    INSERT INTO projetos_malha
                         (contrato_id, malha_arquivo, malha_mtime, rotas_dir, rotas_mtime, n_rotas,
                          n_segmentos, km_total, n_prioritarias, n_preservados, construido_em)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (contrato_id) DO UPDATE SET
+                        malha_arquivo = excluded.malha_arquivo,
+                        malha_mtime = excluded.malha_mtime,
+                        rotas_dir = excluded.rotas_dir,
+                        rotas_mtime = excluded.rotas_mtime,
+                        n_rotas = excluded.n_rotas,
+                        n_segmentos = excluded.n_segmentos,
+                        km_total = excluded.km_total,
+                        n_prioritarias = excluded.n_prioritarias,
+                        n_preservados = excluded.n_preservados,
+                        construido_em = CURRENT_TIMESTAMP
                     """,
                     (contrato_id, malha_path, malha_mtime, dir_rotas(), rotas_mtime, n_rotas,
                      len(registros), km_total, sum(r["is_priority"] for r in registros), len(preservar_ids)),

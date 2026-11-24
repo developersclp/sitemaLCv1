@@ -5,3 +5,5 @@ pyogrio>=0.7.2
 shapely>=2.0.0
 pandas>=2.0.0
 pyproj>=3.6.0
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.2.0
