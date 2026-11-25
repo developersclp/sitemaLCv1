@@ -180,7 +180,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <title>LOCAR - Mapa de Execução · Inlog, Auditoria & GIS</title>
     <!-- __SHARED_LOCK_INIT__ -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <link rel="stylesheet" href="/static/correcao_rotas.css" />
+    <link rel="stylesheet" href="/static/correcao_rotas.css?v=__STATIC_VER__" />
     <script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -4194,7 +4194,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             carregarAuditoria(false);
         };
     </script>
-    <script src="/static/correcao_rotas.js"></script>
+    <script src="/static/correcao_rotas.js?v=__STATIC_VER__"></script>
 </body>
 </html>
 """
@@ -4287,7 +4287,19 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
 
     def _render_html_com_lock(self, shared_lock: Dict[str, Any]) -> bytes:
         script_tag = f"<script>window.__SHARED_LOCK__ = {json.dumps(shared_lock, ensure_ascii=False)};</script>"
-        return HTML_PAGE.replace("<!-- __SHARED_LOCK_INIT__ -->", script_tag).encode("utf-8")
+        static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+        mtimes = []
+        for fn in ("correcao_rotas.js", "correcao_rotas.css"):
+            fp = os.path.join(static_dir, fn)
+            if os.path.isfile(fp):
+                mtimes.append(int(os.path.getmtime(fp)))
+        ver_static = str(max(mtimes)) if mtimes else "1"
+        return (
+            HTML_PAGE
+            .replace("<!-- __SHARED_LOCK_INIT__ -->", script_tag)
+            .replace("__STATIC_VER__", ver_static)
+            .encode("utf-8")
+        )
 
     def log_message(self, format, *args):
         # Log conciso das requisições no console operacional
@@ -4326,7 +4338,10 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_response(200)
                     self.send_header("Content-Type", ctype)
-                self.send_header("Cache-Control", "public, max-age=86400")
+                if ext in (".js", ".css"):
+                    self.send_header("Cache-Control", "no-cache, must-revalidate")
+                else:
+                    self.send_header("Cache-Control", "public, max-age=86400")
                 self.send_header("Content-Length", str(len(st_bytes)))
                 self.end_headers()
                 self.wfile.write(st_bytes)
