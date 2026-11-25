@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 import correcao_rotas
 import database as db
 import indicadores
+import inlog_editor_rotas
 import malha_rotas
 import snapshots
 from inlog_service import InlogService, formatar_placa_hifen, identificar_contrato
@@ -1718,6 +1719,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         🌍 Extrair .geojson
                     </button>
                     <input type="file" id="inputSolExtrairGeoAvulso" accept=".pdf,application/pdf" style="display:none;" />
+                    <button type="button" class="btn-locar" id="btnSolPublicarGpkgAvulso" title="Subir um arquivo .gpkg editado no QGIS, converter para Shapefile e publicar na Inlog">
+                        🚀 Subir .gpkg (Inlog)
+                    </button>
                     <button type="button" class="btn-outline" id="btnSolAtualizarLista">🔄 Atualizar</button>
                     <button type="button" class="btn-close-modal" id="btnFecharAdminSolicitacoes">✕</button>
                 </div>
@@ -4663,6 +4667,41 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(geo_bytes)
             return
 
+        if path == "/api/correcao-rotas/metadados-setor-inlog":
+            cid_req = query.get("cidade", [""])[0].strip()
+            setor_req = query.get("setor", [""])[0].strip()
+            meta = correcao_rotas.obter_metadados_setor_inlog(cid_req, setor_req)
+            self._send_json({"sucesso": True, "meta": meta})
+            return
+
+        if path == "/api/correcao-rotas/publicar-status":
+            job_id = query.get("job_id", [""])[0].strip()
+            st = inlog_editor_rotas.obter_status_job_publicacao(job_id)
+            if not st:
+                self._send_json({"sucesso": False, "erro": "Job de publicação não encontrado ou expirado."}, status=404)
+                return
+            self._send_json({"sucesso": True, **st})
+            return
+
+        if path == "/api/correcao-rotas/publicar-download-zip":
+            job_id = query.get("job_id", [""])[0].strip()
+            arq = inlog_editor_rotas.obter_zip_job_publicacao(job_id)
+            if not arq:
+                self._send_json({"sucesso": False, "erro": "Shapefile (.zip) não disponível para este job."}, status=404)
+                return
+            zip_bytes, filename = arq
+            safe_ascii = filename.replace('"', "")
+            quoted_utf8 = urllib.parse.quote(filename)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{quoted_utf8}')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(zip_bytes)))
+            self.end_headers()
+            self.wfile.write(zip_bytes)
+            return
+
         # 3b. Listar Snapshots Gerados (Painel Central)
         if path == "/api/compartilhar/listar":
             cid_filtro = query.get("cidade", [None])[0]
@@ -5093,6 +5132,85 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 sol_id = str(dados.get("id") or "").strip()
                 ok = correcao_rotas.excluir_solicitacao(sol_id)
                 self._send_json({"sucesso": ok})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        if path == "/api/correcao-rotas/converter-gpkg-shp":
+            try:
+                gpkg_b64 = str(dados.get("gpkg_base64") or "").strip()
+                if "," in gpkg_b64 and gpkg_b64.startswith("data:"):
+                    gpkg_b64 = gpkg_b64.split(",", 1)[1]
+                if not gpkg_b64:
+                    raise ValueError("Arquivo .gpkg não enviado.")
+                gpkg_bytes = base64.b64decode(gpkg_b64)
+                contrato_id = str(dados.get("contrato_id") or "").lower().strip()
+                setor_codigo = str(dados.get("setor_codigo") or "").strip()
+                if not contrato_id or not setor_codigo:
+                    raise ValueError("Cidade e setor são obrigatórios.")
+                meta_def = correcao_rotas.obter_metadados_setor_inlog(contrato_id, setor_codigo)
+                setor_desc = str(dados.get("setor_descricao_inlog") or meta_def["descricao_inlog"]).strip()
+                macro_setor = str(dados.get("macro_setor") or meta_def["macro_setor"]).strip()
+                rota_nome = str(dados.get("rota_nome") or "ROTA SUB").strip() or "ROTA SUB"
+                apelido_rota = str(dados.get("apelido_rota") or rota_nome).strip() or rota_nome
+
+                conv = inlog_editor_rotas.converter_gpkg_para_shapefile_zip(
+                    gpkg_bytes=gpkg_bytes,
+                    contrato_id=contrato_id,
+                    setor_codigo=setor_codigo,
+                    setor_descricao=setor_desc,
+                    macro_setor=macro_setor,
+                    rota_nome=rota_nome,
+                    apelido_rota=apelido_rota,
+                    nome_arquivo_base=setor_codigo,
+                )
+                self._send_json({
+                    "sucesso": True,
+                    "zip_filename": conv["zip_filename"],
+                    "zip_base64": base64.b64encode(conv["zip_bytes"]).decode("ascii"),
+                    "resumo": conv["resumo"],
+                })
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        if path == "/api/correcao-rotas/publicar-gpkg-inlog":
+            try:
+                gpkg_b64 = str(dados.get("gpkg_base64") or "").strip()
+                if "," in gpkg_b64 and gpkg_b64.startswith("data:"):
+                    gpkg_b64 = gpkg_b64.split(",", 1)[1]
+                if not gpkg_b64:
+                    raise ValueError("Arquivo .gpkg não enviado.")
+                gpkg_bytes = base64.b64decode(gpkg_b64)
+                contrato_id = str(dados.get("contrato_id") or "").lower().strip()
+                setor_codigo = str(dados.get("setor_codigo") or "").strip()
+                if not contrato_id or not setor_codigo:
+                    raise ValueError("Cidade e setor são obrigatórios.")
+
+                meta_def = correcao_rotas.obter_metadados_setor_inlog(contrato_id, setor_codigo)
+                setor_desc = str(dados.get("setor_descricao_inlog") or meta_def["descricao_inlog"]).strip()
+                macro_setor = str(dados.get("macro_setor") or meta_def["macro_setor"]).strip()
+                rota_nome = str(dados.get("rota_nome") or "ROTA SUB").strip() or "ROTA SUB"
+                apelido_rota = str(dados.get("apelido_rota") or rota_nome).strip() or rota_nome
+                atualizar_local = bool(dados.get("atualizar_local", True))
+                publicar_inlog = bool(dados.get("publicar_inlog", True))
+                sol_id = str(dados.get("sol_id") or "").strip() or None
+
+                job = inlog_editor_rotas.iniciar_job_publicacao_inlog(
+                    gpkg_bytes=gpkg_bytes,
+                    contrato_id=contrato_id,
+                    setor_codigo=setor_codigo,
+                    setor_descricao=setor_desc,
+                    macro_setor=macro_setor,
+                    rota_nome=rota_nome,
+                    apelido_rota=apelido_rota,
+                    atualizar_local=atualizar_local,
+                    publicar_inlog=publicar_inlog,
+                    sol_id=sol_id,
+                    atualizar_local_fn=correcao_rotas.atualizar_rota_planejada_local,
+                    concluir_solicitacao_fn=correcao_rotas.concluir_solicitacao_com_nota,
+                )
+                self._send_json({"sucesso": True, **job})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return

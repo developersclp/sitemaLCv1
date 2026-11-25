@@ -2665,7 +2665,11 @@
                 });
                 h += '</tbody></table></div></div>';
 
+                // Etapa Final: Upload do .gpkg editado no QGIS -> Conversão Shapefile -> Publicação Inlog
+                h += renderizarHtmlPainelGpkgInlog(s.contrato_id, (s.setores && s.setores[0]) || '', s.id);
+
                 detBox.innerHTML = h;
+                inicializarEventosPainelGpkgInlog(s.contrato_id, (s.setores && s.setores[0]) || '', s.id, s.setores || []);
 
                 if ($('btnSolTogglePdf')) {
                     $('btnSolTogglePdf').onclick = function () {
@@ -2716,6 +2720,388 @@
                     };
                 }
             });
+    }
+
+    var _gpkgPollTimer = null;
+    var _gpkgFileAtual = null;
+
+    var CIDADES_INLOG_OPCOES = [
+        ['cabo', 'Cabo de Santo Agostinho'],
+        ['jaboatao', 'Jaboatão dos Guararapes'],
+        ['olinda', 'Olinda'],
+        ['paulista', 'Paulista'],
+        ['caruaru', 'Caruaru'],
+        ['cuiaba', 'Cuiabá'],
+        ['garanhuns', 'Garanhuns'],
+        ['pesqueira', 'Pesqueira'],
+        ['vitoria', 'Vitória de Santo Antão'],
+        ['canela', 'Canela'],
+        ['jequie', 'Jequié'],
+        ['novo hamburgo', 'Novo Hamburgo']
+    ];
+
+    function renderizarHtmlPainelGpkgInlog(contratoId, setorInicial, solId) {
+        var cid = String(contratoId || 'garanhuns').toLowerCase().trim();
+        if (cid === 'all' || !cid) cid = 'garanhuns';
+        var cOpts = CIDADES_INLOG_OPCOES.map(function (c) {
+            return '<option value="' + esc(c[0]) + '"' + (c[0] === cid ? ' selected' : '') + '>' + esc(c[1]) + '</option>';
+        }).join('');
+
+        return '<div class="sol-gpkg-card" id="solGpkgPublishCard">' +
+            '<div class="sol-gpkg-header">' +
+            '<div class="sol-gpkg-title">🚀 Etapa Final: Subir .gpkg Editado (Converter Shapefile + Publicar na Inlog)</div>' +
+            '<span style="font-size:0.71rem;color:#047857;font-weight:700;">Automação QGIS → .shp (.zip) → Inlog EditorRotas</span>' +
+            '</div>' +
+            '<div class="sol-gpkg-drop">' +
+            '<div style="flex:1;min-width:200px;">' +
+            '<div style="font-size:0.78rem;font-weight:700;color:#0F172A;" id="solGpkgFileLabel">Nenhum arquivo .gpkg selecionado</div>' +
+            '<div style="font-size:0.71rem;color:#64748B;">Selecione o arquivo .gpkg atualizado no QGIS (ex.: SCPN 19.gpkg)</div>' +
+            '</div>' +
+            '<button type="button" class="cr-btn-sec" id="btnSolEscolherGpkg" style="border-color:#16A34A;color:#065F46;font-weight:700;">📂 Selecionar .gpkg</button>' +
+            '<input type="file" id="inputSolGpkgFile" accept=".gpkg" style="display:none;" />' +
+            '</div>' +
+            '<div class="sol-gpkg-grid">' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgCidadeSelect">Cidade / Perfil Inlog</label>' +
+            '<select id="solGpkgCidadeSelect" class="cr-select" style="padding:6px 8px;font-size:0.79rem;">' + cOpts + '</select>' +
+            '</div>' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgSetorSelect">Setor da Rota</label>' +
+            '<select id="solGpkgSetorSelect" class="cr-select" style="padding:6px 8px;font-size:0.79rem;"><option value="">Carregando setores...</option></select>' +
+            '</div>' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgSetorInlog">Descrição do Setor (campo SETOR / Inlog)</label>' +
+            '<input type="text" id="solGpkgSetorInlog" class="cr-input" style="padding:6px 9px;font-size:0.79rem;" placeholder="Ex.: GARANHUNS - SCPN 19" />' +
+            '</div>' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgMacroInlog">Macro Setor (campo MACRO)</label>' +
+            '<input type="text" id="solGpkgMacroInlog" class="cr-input" style="padding:6px 9px;font-size:0.79rem;" placeholder="Ex.: GARANHUNS - DOMICILIAR" />' +
+            '</div>' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgRotaNome">Nome da Rota (campo ROTA)</label>' +
+            '<input type="text" id="solGpkgRotaNome" class="cr-input" style="padding:6px 9px;font-size:0.79rem;" value="ROTA SUB" />' +
+            '</div>' +
+            '<div class="sol-gpkg-field">' +
+            '<label for="solGpkgApelido">Apelido da Rota (campo APELIDO)</label>' +
+            '<input type="text" id="solGpkgApelido" class="cr-input" style="padding:6px 9px;font-size:0.79rem;" value="ROTA SUB" />' +
+            '</div>' +
+            '</div>' +
+            '<div class="sol-gpkg-checks">' +
+            '<label><input type="checkbox" id="solGpkgChkAtualizarLocal" checked /> Atualizar também o .gpkg oficial em "Rotas Planejadas" e reconstruir mapa do Sistema LC</label>' +
+            '<label><input type="checkbox" id="solGpkgChkPublicarInlog" checked /> Logar na Inlog (carlos.dorth), selecionar cidade, inativar/excluir rota antiga, importar .shp e ativar nova rota</label>' +
+            '</div>' +
+            '<div class="sol-gpkg-actions">' +
+            '<button type="button" class="cr-btn-sec" id="btnSolConverterShpZip" style="border-color:#038242;color:#006331;">📦 Converter e Baixar Shapefile (.zip)</button>' +
+            '<button type="button" class="cr-btn" id="btnSolPublicarInlog" style="padding:8px 14px;font-size:0.80rem;">🚀 Converter, Atualizar Sistema e Publicar na Inlog</button>' +
+            '<span id="solGpkgZipExtraWrap"></span>' +
+            '</div>' +
+            '<div id="solGpkgProgressWrap" class="sol-gpkg-progress-wrap" style="display:none;">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+            '<strong id="solGpkgProgEtapa">Preparando...</strong>' +
+            '<strong id="solGpkgProgPct" style="color:#34D399;">0%</strong>' +
+            '</div>' +
+            '<div class="sol-gpkg-bar-track"><div class="sol-gpkg-bar-fill" id="solGpkgProgBar"></div></div>' +
+            '<div class="sol-gpkg-logs" id="solGpkgProgLogs"></div>' +
+            '<div id="solGpkgProgLinks" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;"></div>' +
+            '</div>' +
+            '</div>';
+    }
+
+    function abrirPainelPublicarGpkgDireto() {
+        solSelecionadaId = null;
+        Array.prototype.forEach.call(document.querySelectorAll('#solListaContainer .sol-card-item'), function (el) {
+            el.classList.remove('ativo');
+        });
+        var detBox = $('solDetalheContainer');
+        if (!detBox) return;
+        var selCidEl = document.getElementById('selectCidade');
+        var cidAtual = (selCidEl && selCidEl.value && selCidEl.value !== 'all') ? selCidEl.value : 'garanhuns';
+        var h = '<div style="border-bottom:1px solid #E2E8F0;padding-bottom:8px;">' +
+            '<div style="font-size:1.0rem;font-weight:800;color:#0F172A;">Publicação Direta de Rota Editada (.gpkg)</div>' +
+            '<div style="font-size:0.78rem;color:#64748B;">Converta o .gpkg editado no QGIS para Shapefile (.zip), atualize o Sistema LC e publique automaticamente no Editor de Rotas da Inlog.</div>' +
+            '</div>' +
+            renderizarHtmlPainelGpkgInlog(cidAtual, '', '');
+        detBox.innerHTML = h;
+        inicializarEventosPainelGpkgInlog(cidAtual, '', '', []);
+    }
+
+    function inicializarEventosPainelGpkgInlog(contratoId, setorInicial, solId, setoresDaSolic) {
+        if (_gpkgPollTimer) { clearInterval(_gpkgPollTimer); _gpkgPollTimer = null; }
+        _gpkgFileAtual = null;
+
+        var cidSelect = $('solGpkgCidadeSelect');
+        var setorSelect = $('solGpkgSetorSelect');
+        var inpFile = $('inputSolGpkgFile');
+        var btnFile = $('btnSolEscolherGpkg');
+
+        function atualizarMetadadosSetorInlog(cid, codSetor) {
+            if (!cid || !codSetor) return;
+            fetch('/api/correcao-rotas/metadados-setor-inlog?cidade=' + encodeURIComponent(cid) + '&setor=' + encodeURIComponent(codSetor))
+                .then(function (r) { return r.json(); })
+                .then(function (j) {
+                    if (!j || !j.sucesso || !j.meta) return;
+                    if ($('solGpkgSetorInlog')) $('solGpkgSetorInlog').value = j.meta.descricao_inlog || '';
+                    if ($('solGpkgMacroInlog')) $('solGpkgMacroInlog').value = j.meta.macro_setor || '';
+                })
+                .catch(function () {});
+        }
+
+        function carregarSetoresDaCidade(cid, setorPreferido) {
+            if (!setorSelect) return;
+            setorSelect.innerHTML = '<option value="">Carregando setores...</option>';
+            fetch('/api/correcao-rotas/setores-contrato?cidade=' + encodeURIComponent(cid))
+                .then(function (r) { return r.json(); })
+                .then(function (j) {
+                    var lista = (j && j.sucesso && Array.isArray(j.setores)) ? j.setores : [];
+                    var codigosSet = {};
+                    var opts = [];
+                    (setoresDaSolic || []).forEach(function (cs) {
+                        if (cs && !codigosSet[cs]) { codigosSet[cs] = 1; opts.push({ codigo: cs, agenda: 'Solicitação' }); }
+                    });
+                    lista.forEach(function (it) {
+                        if (it && it.codigo && !codigosSet[it.codigo]) { codigosSet[it.codigo] = 1; opts.push(it); }
+                    });
+                    if (!opts.length) {
+                        setorSelect.innerHTML = '<option value="">Nenhum setor encontrado</option>';
+                        return;
+                    }
+                    setorSelect.innerHTML = opts.map(function (it) {
+                        var extra = it.agenda ? ' · ' + it.agenda : '';
+                        return '<option value="' + esc(it.codigo) + '">' + esc(it.codigo + extra) + '</option>';
+                    }).join('');
+                    var alvo = setorPreferido && codigosSet[setorPreferido] ? setorPreferido : opts[0].codigo;
+                    setorSelect.value = alvo;
+                    atualizarMetadadosSetorInlog(cid, alvo);
+                })
+                .catch(function () {
+                    setorSelect.innerHTML = '<option value="">Erro ao listar setores</option>';
+                });
+        }
+
+        function tentarDetectarSetorPeloNomeArquivo(nomeArq) {
+            if (!nomeArq || !setorSelect) return;
+            var normNome = String(nomeArq).toUpperCase().replace(/\.GPKG$/i, '').replace(/\(\d+\)/g, ' ').replace(/\s+/g, ' ').trim();
+            var opcoes = Array.prototype.map.call(setorSelect.options, function (o) { return o.value; }).filter(Boolean);
+            var melhor = null;
+            opcoes.forEach(function (cod) {
+                var cu = cod.toUpperCase();
+                if (normNome.indexOf(cu) >= 0) {
+                    if (!melhor || cu.length > melhor.length) melhor = cod;
+                }
+            });
+            if (!melhor) {
+                var m = normNome.match(/\b(SC[A-Z]{1,6})\s*0*(\d{1,4})\b/);
+                if (m) {
+                    var pref = m[1], num = parseInt(m[2], 10);
+                    opcoes.forEach(function (cod) {
+                        var mc = cod.toUpperCase().match(/\b(SC[A-Z]{1,6})\s*0*(\d{1,4})\b/);
+                        if (mc && mc[1] === pref && parseInt(mc[2], 10) === num) melhor = cod;
+                    });
+                }
+            }
+            if (melhor) {
+                setorSelect.value = melhor;
+                atualizarMetadadosSetorInlog(cidSelect.value, melhor);
+                crToast('Setor "' + melhor + '" detectado pelo nome do arquivo!');
+            }
+        }
+
+        if (cidSelect) {
+            cidSelect.onchange = function () {
+                carregarSetoresDaCidade(cidSelect.value, '');
+            };
+        }
+        if (setorSelect) {
+            setorSelect.onchange = function () {
+                atualizarMetadadosSetorInlog(cidSelect ? cidSelect.value : contratoId, setorSelect.value);
+            };
+        }
+        if (btnFile && inpFile) {
+            btnFile.onclick = function () { inpFile.click(); };
+            inpFile.onchange = function () {
+                var f = this.files && this.files[0];
+                if (!f) return;
+                _gpkgFileAtual = f;
+                if ($('solGpkgFileLabel')) $('solGpkgFileLabel').textContent = '✅ ' + f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+                tentarDetectarSetorPeloNomeArquivo(f.name);
+            };
+        }
+
+        function coletarParamsGpkg() {
+            if (!_gpkgFileAtual) {
+                crToast('Selecione primeiro o arquivo .gpkg editado no QGIS.');
+                return null;
+            }
+            var cid = (cidSelect && cidSelect.value) || contratoId;
+            var setor = (setorSelect && setorSelect.value) || '';
+            if (!cid || !setor) {
+                crToast('Escolha a cidade e o setor de destino.');
+                return null;
+            }
+            return {
+                file: _gpkgFileAtual,
+                contrato_id: cid,
+                setor_codigo: setor,
+                setor_descricao_inlog: ($('solGpkgSetorInlog') && $('solGpkgSetorInlog').value.trim()) || '',
+                macro_setor: ($('solGpkgMacroInlog') && $('solGpkgMacroInlog').value.trim()) || '',
+                rota_nome: ($('solGpkgRotaNome') && $('solGpkgRotaNome').value.trim()) || 'ROTA SUB',
+                apelido_rota: ($('solGpkgApelido') && $('solGpkgApelido').value.trim()) || 'ROTA SUB',
+                atualizar_local: $('solGpkgChkAtualizarLocal') ? $('solGpkgChkAtualizarLocal').checked : true,
+                publicar_inlog: $('solGpkgChkPublicarInlog') ? $('solGpkgChkPublicarInlog').checked : true,
+                sol_id: solId || ''
+            };
+        }
+
+        if ($('btnSolConverterShpZip')) {
+            $('btnSolConverterShpZip').onclick = function () {
+                var params = coletarParamsGpkg();
+                if (!params) return;
+                var btn = this;
+                btn.disabled = true;
+                btn.textContent = '⏳ Convertendo...';
+                blobParaBase64(params.file).then(function (b64) {
+                    return fetch('/api/correcao-rotas/converter-gpkg-shp', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            gpkg_base64: b64,
+                            contrato_id: params.contrato_id,
+                            setor_codigo: params.setor_codigo,
+                            setor_descricao_inlog: params.setor_descricao_inlog,
+                            macro_setor: params.macro_setor,
+                            rota_nome: params.rota_nome,
+                            apelido_rota: params.apelido_rota
+                        })
+                    }).then(function (r) { return r.json(); });
+                }).then(function (res) {
+                    btn.disabled = false;
+                    btn.textContent = '📦 Converter e Baixar Shapefile (.zip)';
+                    if (!res || !res.sucesso) {
+                        crToast('Erro ao converter: ' + ((res && res.erro) || 'falha desconhecida'));
+                        return;
+                    }
+                    var bin = atob(res.zip_base64);
+                    var bytes = new Uint8Array(bin.length);
+                    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    baixarBlob(new Blob([bytes], { type: 'application/zip' }), res.zip_filename || 'rotas.zip');
+                    var rsm = res.resumo || {};
+                    crToast('Shapefile "' + res.zip_filename + '" gerado (' + (rsm.trechos_shapefile || 0) + ' trechos, ' + (rsm.km_coleta || 0) + ' km coleta)!');
+                }).catch(function (e) {
+                    btn.disabled = false;
+                    btn.textContent = '📦 Converter e Baixar Shapefile (.zip)';
+                    crToast('Falha na conversão: ' + e.message);
+                });
+            };
+        }
+
+        if ($('btnSolPublicarInlog')) {
+            $('btnSolPublicarInlog').onclick = function () {
+                var params = coletarParamsGpkg();
+                if (!params) return;
+                if (!params.atualizar_local && !params.publicar_inlog) {
+                    crToast('Marque ao menos uma ação (Sistema LC ou Inlog).');
+                    return;
+                }
+                var btn = this;
+                btn.disabled = true;
+                btn.textContent = '⏳ Executando automação...';
+                var pWrap = $('solGpkgProgressWrap');
+                if (pWrap) pWrap.style.display = 'block';
+                if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = 'Enviando arquivo .gpkg para o servidor...';
+                if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = '5%';
+                if ($('solGpkgProgBar')) $('solGpkgProgBar').style.width = '5%';
+                if ($('solGpkgProgLogs')) $('solGpkgProgLogs').textContent = '';
+                if ($('solGpkgProgLinks')) $('solGpkgProgLinks').innerHTML = '';
+
+                blobParaBase64(params.file).then(function (b64) {
+                    return fetch('/api/correcao-rotas/publicar-gpkg-inlog', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            gpkg_base64: b64,
+                            contrato_id: params.contrato_id,
+                            setor_codigo: params.setor_codigo,
+                            setor_descricao_inlog: params.setor_descricao_inlog,
+                            macro_setor: params.macro_setor,
+                            rota_nome: params.rota_nome,
+                            apelido_rota: params.apelido_rota,
+                            atualizar_local: params.atualizar_local,
+                            publicar_inlog: params.publicar_inlog,
+                            sol_id: params.sol_id
+                        })
+                    }).then(function (r) { return r.json(); });
+                }).then(function (startRes) {
+                    if (!startRes || !startRes.sucesso || !startRes.job_id) {
+                        btn.disabled = false;
+                        btn.textContent = '🚀 Converter, Atualizar Sistema e Publicar na Inlog';
+                        crToast('Erro ao iniciar publicação: ' + ((startRes && startRes.erro) || 'falha'));
+                        return;
+                    }
+                    var jobId = startRes.job_id;
+                    if (_gpkgPollTimer) clearInterval(_gpkgPollTimer);
+                    _gpkgPollTimer = setInterval(function () {
+                        fetch('/api/correcao-rotas/publicar-status?job_id=' + encodeURIComponent(jobId))
+                            .then(function (r) { return r.json(); })
+                            .then(function (st) {
+                                if (!st || !st.sucesso) return;
+                                var pct = Number(st.progresso || 0);
+                                if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = st.etapa_atual || '';
+                                if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = pct + '%';
+                                if ($('solGpkgProgBar')) $('solGpkgProgBar').style.width = pct + '%';
+                                if ($('solGpkgProgLogs')) {
+                                    $('solGpkgProgLogs').textContent = (st.logs || []).join('\n');
+                                    $('solGpkgProgLogs').scrollTop = $('solGpkgProgLogs').scrollHeight;
+                                }
+
+                                if (st.status === 'CONCLUIDO' || st.status === 'ERRO') {
+                                    clearInterval(_gpkgPollTimer);
+                                    _gpkgPollTimer = null;
+                                    btn.disabled = false;
+                                    btn.textContent = '🚀 Converter, Atualizar Sistema e Publicar na Inlog';
+
+                                    var linksHtml = '';
+                                    if (st.tem_zip) {
+                                        linksHtml += '<a class="cr-btn-sec" href="/api/correcao-rotas/publicar-download-zip?job_id=' + encodeURIComponent(jobId) + '" style="text-decoration:none;background:#FFFFFF;">⬇ Baixar ' + esc(st.zip_filename || 'rotas.zip') + '</a>';
+                                    }
+                                    if (st.status === 'CONCLUIDO' && st.resultado && st.resultado.inlog && st.resultado.inlog.url_editor) {
+                                        linksHtml += '<a class="cr-btn" href="' + esc(st.resultado.inlog.url_editor) + '" target="_blank" style="text-decoration:none;padding:7px 12px;font-size:0.78rem;">↗ Abrir Rota na Inlog</a>';
+                                    }
+                                    if ($('solGpkgProgLinks')) $('solGpkgProgLinks').innerHTML = linksHtml;
+
+                                    if (st.status === 'CONCLUIDO') {
+                                        crToast('Rota convertida e publicada com sucesso!');
+                                        if ($('solSelectNovoStatus')) $('solSelectNovoStatus').value = 'CONCLUIDA';
+                                        atualizarBadgePendentesAdmin();
+                                        if (params.sol_id) {
+                                            var cardItem = document.querySelector('#solListaContainer .sol-card-item[data-id="' + params.sol_id + '"] .sol-status-pill');
+                                            if (cardItem) {
+                                                cardItem.className = 'sol-status-pill sol-status-CONCLUIDA';
+                                                cardItem.textContent = 'Concluída';
+                                            }
+                                        }
+                                        if (params.atualizar_local && window.__SISTEMA_LC__) {
+                                            var selC = document.getElementById('selectCidade');
+                                            if (selC && selC.value === params.contrato_id) {
+                                                var btnRef = document.getElementById('btnAtualizar');
+                                                if (btnRef) btnRef.click();
+                                            }
+                                        }
+                                    } else {
+                                        crToast('Erro na automação: ' + (st.erro || 'verifique o log'));
+                                    }
+                                }
+                            })
+                            .catch(function () {});
+                    }, 1100);
+                }).catch(function (e) {
+                    btn.disabled = false;
+                    btn.textContent = '🚀 Converter, Atualizar Sistema e Publicar na Inlog';
+                    crToast('Falha ao iniciar publicação: ' + e.message);
+                });
+            };
+        }
+
+        carregarSetoresDaCidade(cidSelect ? cidSelect.value : contratoId, setorInicial);
     }
 
     function visualizarGeoJsonSolicitacaoNoMapa(sol) {
@@ -2876,6 +3262,10 @@
                 this.value = '';
                 if (f) extrairGeoJsonLocalDePdf(f);
             });
+        }
+
+        if ($('btnSolPublicarGpkgAvulso')) {
+            $('btnSolPublicarGpkgAvulso').addEventListener('click', abrirPainelPublicarGpkgDireto);
         }
 
         setTimeout(atualizarBadgePendentesAdmin, 1200);

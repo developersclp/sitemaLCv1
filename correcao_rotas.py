@@ -9,6 +9,7 @@ no Painel Central Administrativo.
 import base64
 import gzip
 import json
+import os
 import re
 import secrets
 from datetime import datetime
@@ -504,3 +505,148 @@ def listar_setores_contrato(contrato_id: str) -> List[Dict[str, str]]:
             "turno": "Noturno" if nom.get("turno") == "NOTURNO" else "Diurno",
         })
     return saida
+
+
+def obter_metadados_setor_inlog(contrato_id: str, setor_codigo: str) -> Dict[str, Any]:
+    """
+    Resolve a descrição oficial e o macro setor cadastrados na Inlog (tabela inlog_setores)
+    para preencher o campo SETOR e MACRO do Shapefile (.dbf) e localizar o setor no EditorRotas.
+    """
+    cid = str(contrato_id or "").lower().strip()
+    cod = str(setor_codigo or "").strip()
+    nom = malha_rotas.analisar_nomenclatura_setor(cod, contrato_id=cid)
+    turno = nom.get("turno") or "DIURNO"
+    cod_canon = malha_rotas.extrair_codigo_setor(cod)
+
+    conn = db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT identificador, descricao, apelido, macro_setor, tipo, grupo_setor FROM inlog_setores WHERE contrato_id = ?",
+            (cid,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    melhor = None
+    cod_upper = malha_rotas.normalizar_ascii(cod)
+    for r in rows:
+        desc_u = malha_rotas.normalizar_ascii(r["descricao"])
+        ap_u = malha_rotas.normalizar_ascii(r["apelido"])
+        if ap_u == cod_upper or desc_u == cod_upper:
+            melhor = r
+            break
+    if not melhor and cod_canon:
+        for r in rows:
+            if (
+                malha_rotas.extrair_codigo_setor(r["apelido"]) == cod_canon
+                or malha_rotas.extrair_codigo_setor(r["descricao"]) == cod_canon
+            ):
+                melhor = r
+                break
+    if not melhor and cod_upper:
+        for r in rows:
+            if cod_upper in malha_rotas.normalizar_ascii(r["descricao"]) or cod_upper in malha_rotas.normalizar_ascii(r["apelido"]):
+                melhor = r
+                break
+
+    cidade_upper = malha_rotas.nome_cidade_arquivo(cid)
+    if melhor:
+        desc_oficial = str(melhor["descricao"] or "").strip()
+        macro_oficial = str(melhor["macro_setor"] or melhor["grupo_setor"] or "").strip()
+        apelido_oficial = str(melhor["apelido"] or cod).strip()
+        ident = str(melhor["identificador"] or "").strip()
+    else:
+        desc_oficial = f"{cidade_upper} - {cod}".strip(" -")
+        macro_oficial = f"{cidade_upper} - DOMICILIAR".strip(" -")
+        apelido_oficial = cod
+        ident = ""
+
+    return {
+        "contrato_id": cid,
+        "setor_codigo": cod,
+        "identificador": ident,
+        "descricao_inlog": desc_oficial,
+        "apelido_inlog": apelido_oficial,
+        "macro_setor": macro_oficial,
+        "turno": turno,
+    }
+
+
+def atualizar_rota_planejada_local(contrato_id: str, setor_codigo: str, gpkg_bytes: bytes) -> Dict[str, Any]:
+    """
+    Substitui (ou grava) o arquivo .gpkg atualizado do setor em 'Rotas Planejadas/<CIDADE> - <TURNO>/rotas/',
+    limpa caches de malha_rotas/auditoria e reconstrói o projeto da cidade no banco do Sistema LC.
+    """
+    cid = str(contrato_id or "").lower().strip()
+    cod = str(setor_codigo or "").strip()
+    if not cid or not cod:
+        raise ValueError("Cidade e código do setor são obrigatórios para atualizar a rota local.")
+
+    rota_atual = malha_rotas.resolver_rota_setor(cid, cod)
+    if rota_atual and rota_atual.get("path"):
+        destino = rota_atual["path"]
+    else:
+        raiz = malha_rotas.dir_rotas()
+        if not raiz:
+            raise RuntimeError("Diretório 'Rotas Planejadas' não encontrado no servidor.")
+        nom = malha_rotas.analisar_nomenclatura_setor(cod, contrato_id=cid)
+        turno = "NOTURNO" if nom.get("turno") == "NOTURNO" else "DIURNO"
+        cidade_dir = f"{malha_rotas.nome_cidade_arquivo(cid)} - {turno}"
+        pasta_rotas = os.path.join(raiz, cidade_dir, "rotas")
+        os.makedirs(pasta_rotas, exist_ok=True)
+        safe_cod = re.sub(r'[<>:"/\\|?*]+', "_", cod).strip(" .") or "ROTA"
+        destino = os.path.join(pasta_rotas, f"{safe_cod}.gpkg")
+
+    # Backup fora de 'Rotas Planejadas' para não duplicar arquivos no glob
+    backup_path = None
+    if os.path.isfile(destino):
+        raiz_rotas = malha_rotas.dir_rotas() or os.path.dirname(destino)
+        bkp_dir = os.path.join(os.path.dirname(raiz_rotas), "backups_rotas", cid)
+        os.makedirs(bkp_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        nome_bkp = f"{os.path.splitext(os.path.basename(destino))[0]}_{ts}.gpkg"
+        backup_path = os.path.join(bkp_dir, nome_bkp)
+        try:
+            with open(destino, "rb") as f_old, open(backup_path, "wb") as f_bkp:
+                f_bkp.write(f_old.read())
+        except Exception:
+            backup_path = None
+
+    tmp_dest = destino + f".tmp_{secrets.token_hex(4)}"
+    with open(tmp_dest, "wb") as f_out:
+        f_out.write(gpkg_bytes)
+    os.replace(tmp_dest, destino)
+
+    with malha_rotas._rota_cache_lock:
+        malha_rotas._rotas_index_cache.clear()
+        malha_rotas._rota_edges_cache.clear()
+
+    res_build = malha_rotas.construir_projeto_cidade(cid, forcar=True)
+
+    # Limpa cache de auditoria de período da cidade para refletir a nova rota
+    with db._write_lock:
+        conn = db.get_connection()
+        try:
+            with conn:
+                conn.execute("DELETE FROM auditorias_periodo_cache WHERE chave LIKE ?", (f"{cid}|%",))
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    return {
+        "ok": bool(res_build.get("ok", True)),
+        "arquivo_destino": destino,
+        "backup": backup_path,
+        "n_segmentos": res_build.get("n_segmentos", 0),
+        "km_total": res_build.get("km_total", 0.0),
+    }
+
+
+def concluir_solicitacao_com_nota(sol_id: str, nota_extra: str) -> bool:
+    det = obter_detalhe_solicitacao(sol_id)
+    if not det:
+        return False
+    atual = str(det.get("notas_analise") or "").strip()
+    nova_nota = (atual + "\n" + nota_extra).strip() if atual else nota_extra.strip()
+    return atualizar_status_solicitacao(sol_id, "CONCLUIDA", notas_analise=nova_nota)

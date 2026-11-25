@@ -796,6 +796,7 @@ def init_db():
                     if col_name not in colunas_existentes:
                         cur.execute(f"ALTER TABLE segmentos_viarios ADD COLUMN {col_name} {col_def}")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_seg_edge_key ON segmentos_viarios(contrato_id, edge_key)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_det_segmento ON auditoria_detalhes(segmento_id)")
 
             # Popula contratos padrão com ON CONFLICT DO NOTHING (padrão SQLite + PostgreSQL)
             contratos_iniciais = [
