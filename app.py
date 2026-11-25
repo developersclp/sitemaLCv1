@@ -4700,7 +4700,11 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/correcao-rotas/publicar-download-zip":
             job_id = query.get("job_id", [""])[0].strip()
-            arq = inlog_editor_rotas.obter_zip_job_publicacao(job_id)
+            tipo_zip = query.get("tipo", ["rota"])[0].strip().lower()
+            if tipo_zip == "setor":
+                arq = inlog_editor_rotas.obter_zip_setor_job_publicacao(job_id)
+            else:
+                arq = inlog_editor_rotas.obter_zip_job_publicacao(job_id)
             if not arq:
                 self._send_json({"sucesso": False, "erro": "Shapefile (.zip) não disponível para este job."}, status=404)
                 return
@@ -5168,6 +5172,23 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 macro_setor = str(dados.get("macro_setor") or meta_def["macro_setor"]).strip()
                 rota_nome = str(dados.get("rota_nome") or "ROTA SUB").strip() or "ROTA SUB"
                 apelido_rota = str(dados.get("apelido_rota") or rota_nome).strip() or rota_nome
+                tipo_conv = str(dados.get("tipo") or "rota").strip().lower()
+
+                if tipo_conv == "setor":
+                    conv_s = inlog_editor_rotas.gerar_shapefile_setor_zip(
+                        gpkg_bytes=gpkg_bytes,
+                        contrato_id=contrato_id,
+                        setor_codigo=setor_codigo,
+                        macro_setor=macro_setor,
+                        setor_descricao_fallback=setor_desc,
+                    )
+                    self._send_json({
+                        "sucesso": True,
+                        "zip_filename": conv_s["zip_filename"],
+                        "zip_base64": base64.b64encode(conv_s["zip_bytes"]).decode("ascii"),
+                        "resumo": conv_s["resumo"],
+                    })
+                    return
 
                 conv = inlog_editor_rotas.converter_gpkg_para_shapefile_zip(
                     gpkg_bytes=gpkg_bytes,
@@ -5209,6 +5230,7 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 apelido_rota = str(dados.get("apelido_rota") or rota_nome).strip() or rota_nome
                 atualizar_local = bool(dados.get("atualizar_local", True))
                 publicar_inlog = bool(dados.get("publicar_inlog", True))
+                atualizar_setor_gis = bool(dados.get("atualizar_setor_gis", True))
                 sol_id = str(dados.get("sol_id") or "").strip() or None
 
                 job = inlog_editor_rotas.iniciar_job_publicacao_inlog(
@@ -5221,6 +5243,7 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                     apelido_rota=apelido_rota,
                     atualizar_local=atualizar_local,
                     publicar_inlog=publicar_inlog,
+                    atualizar_setor_gis=atualizar_setor_gis,
                     sol_id=sol_id,
                     atualizar_local_fn=correcao_rotas.atualizar_rota_planejada_local,
                     concluir_solicitacao_fn=correcao_rotas.concluir_solicitacao_com_nota,

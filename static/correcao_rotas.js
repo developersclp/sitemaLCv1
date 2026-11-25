@@ -2787,11 +2787,13 @@
             '</div>' +
             '</div>' +
             '<div class="sol-gpkg-checks">' +
+            '<label><input type="checkbox" id="solGpkgChkAtualizarSetorGis" checked /> Gerar Shapefile do Setor e atualizar no GIS Eyes (clientetvt4.exe — gabriellima)</label>' +
             '<label><input type="checkbox" id="solGpkgChkAtualizarLocal" checked /> Atualizar também o .gpkg oficial em "Rotas Planejadas" e reconstruir mapa do Sistema LC</label>' +
             '<label><input type="checkbox" id="solGpkgChkPublicarInlog" checked /> Logar na Inlog (carlos.dorth), selecionar cidade, inativar/excluir rota antiga, importar .shp e ativar nova rota</label>' +
             '</div>' +
             '<div class="sol-gpkg-actions">' +
-            '<button type="button" class="cr-btn-sec" id="btnSolConverterShpZip" style="border-color:#038242;color:#006331;">📦 Converter e Baixar Shapefile (.zip)</button>' +
+            '<button type="button" class="cr-btn-sec" id="btnSolConverterShpZip" style="border-color:#038242;color:#006331;">📦 Baixar Shape Rota (.zip)</button>' +
+            '<button type="button" class="cr-btn-sec" id="btnSolConverterSetorZip" style="border-color:#0284C7;color:#0369A1;">🗺️ Baixar Shape Setor (.zip)</button>' +
             '<button type="button" class="cr-btn" id="btnSolPublicarInlog" style="padding:8px 14px;font-size:0.80rem;">🚀 Converter, Atualizar Sistema e Publicar na Inlog</button>' +
             '<span id="solGpkgZipExtraWrap"></span>' +
             '</div>' +
@@ -2946,51 +2948,65 @@
                 macro_setor: ($('solGpkgMacroInlog') && $('solGpkgMacroInlog').value.trim()) || '',
                 rota_nome: ($('solGpkgRotaNome') && $('solGpkgRotaNome').value.trim()) || 'ROTA SUB',
                 apelido_rota: ($('solGpkgApelido') && $('solGpkgApelido').value.trim()) || 'ROTA SUB',
+                atualizar_setor_gis: $('solGpkgChkAtualizarSetorGis') ? $('solGpkgChkAtualizarSetorGis').checked : true,
                 atualizar_local: $('solGpkgChkAtualizarLocal') ? $('solGpkgChkAtualizarLocal').checked : true,
                 publicar_inlog: $('solGpkgChkPublicarInlog') ? $('solGpkgChkPublicarInlog').checked : true,
                 sol_id: solId || ''
             };
         }
 
+        function dispararConversaoZip(btn, labelPadrao, tipoConv) {
+            var params = coletarParamsGpkg();
+            if (!params) return;
+            btn.disabled = true;
+            btn.textContent = '⏳ Convertendo...';
+            blobParaBase64(params.file).then(function (b64) {
+                return fetch('/api/correcao-rotas/converter-gpkg-shp', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        tipo: tipoConv,
+                        gpkg_base64: b64,
+                        contrato_id: params.contrato_id,
+                        setor_codigo: params.setor_codigo,
+                        setor_descricao_inlog: params.setor_descricao_inlog,
+                        macro_setor: params.macro_setor,
+                        rota_nome: params.rota_nome,
+                        apelido_rota: params.apelido_rota
+                    })
+                }).then(function (r) { return r.json(); });
+            }).then(function (res) {
+                btn.disabled = false;
+                btn.textContent = labelPadrao;
+                if (!res || !res.sucesso) {
+                    crToast('Erro ao converter: ' + ((res && res.erro) || 'falha desconhecida'));
+                    return;
+                }
+                var bin = atob(res.zip_base64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                baixarBlob(new Blob([bytes], { type: 'application/zip' }), res.zip_filename || (tipoConv === 'setor' ? 'setor.zip' : 'rotas.zip'));
+                var rsm = res.resumo || {};
+                if (tipoConv === 'setor') {
+                    crToast('Shapefile do Setor "' + res.zip_filename + '" gerado (' + (rsm.clusters || 1) + ' cluster(s), Op: ' + (rsm.operacao_giseyes || 'DOMICILIAR F1') + ')!');
+                } else {
+                    crToast('Shapefile "' + res.zip_filename + '" gerado (' + (rsm.trechos_shapefile || 0) + ' trechos, ' + (rsm.km_coleta || 0) + ' km coleta)!');
+                }
+            }).catch(function (e) {
+                btn.disabled = false;
+                btn.textContent = labelPadrao;
+                crToast('Falha na conversão: ' + e.message);
+            });
+        }
+
         if ($('btnSolConverterShpZip')) {
             $('btnSolConverterShpZip').onclick = function () {
-                var params = coletarParamsGpkg();
-                if (!params) return;
-                var btn = this;
-                btn.disabled = true;
-                btn.textContent = '⏳ Convertendo...';
-                blobParaBase64(params.file).then(function (b64) {
-                    return fetch('/api/correcao-rotas/converter-gpkg-shp', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            gpkg_base64: b64,
-                            contrato_id: params.contrato_id,
-                            setor_codigo: params.setor_codigo,
-                            setor_descricao_inlog: params.setor_descricao_inlog,
-                            macro_setor: params.macro_setor,
-                            rota_nome: params.rota_nome,
-                            apelido_rota: params.apelido_rota
-                        })
-                    }).then(function (r) { return r.json(); });
-                }).then(function (res) {
-                    btn.disabled = false;
-                    btn.textContent = '📦 Converter e Baixar Shapefile (.zip)';
-                    if (!res || !res.sucesso) {
-                        crToast('Erro ao converter: ' + ((res && res.erro) || 'falha desconhecida'));
-                        return;
-                    }
-                    var bin = atob(res.zip_base64);
-                    var bytes = new Uint8Array(bin.length);
-                    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-                    baixarBlob(new Blob([bytes], { type: 'application/zip' }), res.zip_filename || 'rotas.zip');
-                    var rsm = res.resumo || {};
-                    crToast('Shapefile "' + res.zip_filename + '" gerado (' + (rsm.trechos_shapefile || 0) + ' trechos, ' + (rsm.km_coleta || 0) + ' km coleta)!');
-                }).catch(function (e) {
-                    btn.disabled = false;
-                    btn.textContent = '📦 Converter e Baixar Shapefile (.zip)';
-                    crToast('Falha na conversão: ' + e.message);
-                });
+                dispararConversaoZip(this, '📦 Baixar Shape Rota (.zip)', 'rota');
+            };
+        }
+        if ($('btnSolConverterSetorZip')) {
+            $('btnSolConverterSetorZip').onclick = function () {
+                dispararConversaoZip(this, '🗺️ Baixar Shape Setor (.zip)', 'setor');
             };
         }
 
@@ -2998,8 +3014,8 @@
             $('btnSolPublicarInlog').onclick = function () {
                 var params = coletarParamsGpkg();
                 if (!params) return;
-                if (!params.atualizar_local && !params.publicar_inlog) {
-                    crToast('Marque ao menos uma ação (Sistema LC ou Inlog).');
+                if (!params.atualizar_setor_gis && !params.atualizar_local && !params.publicar_inlog) {
+                    crToast('Marque ao menos uma ação (GIS Eyes, Sistema LC ou Inlog).');
                     return;
                 }
                 var btn = this;
@@ -3025,6 +3041,7 @@
                             macro_setor: params.macro_setor,
                             rota_nome: params.rota_nome,
                             apelido_rota: params.apelido_rota,
+                            atualizar_setor_gis: params.atualizar_setor_gis,
                             atualizar_local: params.atualizar_local,
                             publicar_inlog: params.publicar_inlog,
                             sol_id: params.sol_id
@@ -3062,6 +3079,9 @@
                                     var linksHtml = '';
                                     if (st.tem_zip) {
                                         linksHtml += '<a class="cr-btn-sec" href="/api/correcao-rotas/publicar-download-zip?job_id=' + encodeURIComponent(jobId) + '" style="text-decoration:none;background:#FFFFFF;">⬇ Baixar ' + esc(st.zip_filename || 'rotas.zip') + '</a>';
+                                    }
+                                    if (st.tem_zip_setor) {
+                                        linksHtml += '<a class="cr-btn-sec" href="/api/correcao-rotas/publicar-download-zip?job_id=' + encodeURIComponent(jobId) + '&tipo=setor" style="text-decoration:none;background:#FFFFFF;">🗺️ Baixar ' + esc(st.zip_setor_filename || 'setor.zip') + '</a>';
                                     }
                                     if (st.status === 'CONCLUIDO' && st.resultado && st.resultado.inlog && st.resultado.inlog.url_editor) {
                                         linksHtml += '<a class="cr-btn" href="' + esc(st.resultado.inlog.url_editor) + '" target="_blank" style="text-decoration:none;padding:7px 12px;font-size:0.78rem;">↗ Abrir Rota na Inlog</a>';

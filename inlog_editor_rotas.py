@@ -19,11 +19,16 @@ Responsabilidades:
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as _wt
+import glob
 import heapq
 import io
 import math
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -35,10 +40,15 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyogrio
 import requests
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiPolygon, Polygon
+from shapely.ops import unary_union
+from shapely.prepared import prep
+from shapely.strtree import STRtree
+from shapely.validation import make_valid
 
 import malha_rotas
 
@@ -51,10 +61,75 @@ INLOG_EDITOR_API_KEY = "0ff6134bec254f9ba1f96d15082d20f2"
 INLOG_DEFAULT_USER = os.getenv("INLOG_WEB_USER", "carlos.dorth").strip()
 INLOG_DEFAULT_PASS = os.getenv("INLOG_WEB_PASS", "Locar1234").strip()
 
+GISEYES_DEFAULT_EMPRESA = os.getenv("GISEYES_EMPRESA", "LOCAR").strip()
+GISEYES_DEFAULT_USER = os.getenv("GISEYES_USER", "GABRIELLIMA").strip()
+GISEYES_DEFAULT_PASS = os.getenv("GISEYES_PASS", "inlog2026").strip()
+
 WGS84_PRJ = (
     'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],'
     'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]'
 )
+
+# Configuração oficial dos contratos para geração de Shapefile de Setor (process_sectors)
+CONTRATOS_SETORES_CFG: Dict[str, Tuple[str, str, str]] = {
+    "vitoria": ("001", "area", "VITORIA"),
+    "paulista": ("002", "area", "PAULISTA"),
+    "cabo": ("004", "area", "CABO"),
+    "olinda": ("005", "streets", "OLINDA"),
+    "caruaru": ("006", "area", "CARUARU"),
+    "garanhuns": ("007", "area", "GARANHUNS"),
+    "pesqueira": ("008", "area", "PESQUEIRA"),
+    "jequie": ("009", "area", "JEQUIE"),
+    "cuiaba": ("010", "area", "CUIABA"),
+    "varzea": ("011", "area", "VARZEA"),
+    "jaboatao": ("012", "area", "JABOATAO"),
+    "canela": ("013", "area", "CANELA"),
+    "novo hamburgo": ("014", "area", "NOVO HAMBURGO"),
+    "novo_hamburgo": ("014", "area", "NOVO HAMBURGO"),
+    "seropedica": ("000", "area", "SEROPEDICA"),
+}
+
+_MALHA_GRAFO_CACHE: Dict[str, Dict[str, Any]] = {}
+_MALHA_GRAFO_LOCK = threading.Lock()
+
+_MALHA_BAIRRO_CACHE: Dict[str, Tuple[gpd.GeoDataFrame, STRtree, List[Any]]] = {}
+_MALHA_BAIRRO_LOCK = threading.Lock()
+
+_PUBLICACAO_JOBS: Dict[str, Dict[str, Any]] = {}
+_PUBLICACAO_LOCK = threading.Lock()
+
+
+_SECTOR_CLUSTER_BUFFER_MULT = 0.75
+_SECTOR_CLUSTER_BUFFER_MIN = 100.0
+_SECTOR_CLUSTER_BUFFER_MAX = 400.0
+_SECTOR_CLUSTER_BUFFER_KNN = 5
+_SECTOR_MIN_ADAPTIVE_CLUSTER = 3
+_SECTOR_BUFFER_MARGIN = 15.0
+_SECTOR_SIMPLIFY_TOL = 2.0
+_SECTOR_BUFFER_RES = 8
+_SECTOR_NAME_MAX_LEN = 250
+
+_SECTOR_WEEKDAY_MAP = {"SEG": 0, "TER": 1, "QUA": 2, "QUI": 3, "SEX": 4, "SAB": 5, "DOM": 6}
+_SECTOR_CODE_TO_DAY = {v: k for k, v in _SECTOR_WEEKDAY_MAP.items()}
+_SECTOR_AVENUE_HW = frozenset({
+    "trunk_link", "tertiary_link", "tertiary", "primary_link", "secondary",
+    "trunk", "primary", "motorway_link", "motorway", "secondary_link",
+})
+_SECTOR_STREET_ABBREV = (
+    (r"^AVENIDA ", "AV "),
+    (r"^RODOVIA ", "ROD "),
+    (r"^ESTRADA ", "ESTR "),
+    (r"^TRAVESSA ", "TV "),
+)
+_SECTOR_AREA_ABBREV = (
+    (r"^RESIDENCIAL ", "RES "),
+    (r"^CONJUNTO ", "CONJ "),
+    (r"^JARDIM ", "JD "),
+    (r"^LOTEAMENTO ", "LOT "),
+    (r"^PARQUE ", "PQ "),
+)
+_SECTOR_WEEKDAY_RE = re.compile(r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\b")
+_SECTOR_ORDINAL_RE = re.compile(r"\b(?:DOM|SEG|TER|QUA|QUI|SEX|SAB)\s*(?:[1-5]|L)")
 
 # Aliases de contrato -> nome esperado no dropdown de vínculos do Autenticador Inlog
 CONTRATO_VINCULO_ALIASES: Dict[str, List[str]] = {
@@ -73,13 +148,6 @@ CONTRATO_VINCULO_ALIASES: Dict[str, List[str]] = {
     "varzea": ["VARZEA"],
     "seropedica": ["SEROPEDICA"],
 }
-
-_MALHA_GRAFO_CACHE: Dict[str, Dict[str, Any]] = {}
-_MALHA_GRAFO_LOCK = threading.Lock()
-
-_PUBLICACAO_JOBS: Dict[str, Dict[str, Any]] = {}
-_PUBLICACAO_LOCK = threading.Lock()
-
 
 def _norm_txt(texto: Any) -> str:
     if texto is None:
@@ -826,6 +894,978 @@ def converter_gpkg_para_shapefile_zip(
 
 
 # ==============================================================================
+# GERAÇÃO DE SHAPEFILE DE SETOR (RÉPLICA DE process_sectors)
+# ==============================================================================
+def _sector_safe_str(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, float) and math.isnan(val):
+        return ""
+    s = str(val).strip()
+    return "" if s.lower() in ("nan", "none", "null") else s
+
+
+def _sector_normalize_label(text: str) -> str:
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+    s = re.sub(r"[^A-Z0-9 ]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _sector_apply_abbrev(text: str, table: Tuple[Tuple[str, str], ...]) -> str:
+    out = _sector_normalize_label(text)
+    for pat, repl in table:
+        out = re.sub(pat, repl, out)
+    return out.strip()
+
+
+def _sector_area_to_label(area_name: str) -> str:
+    parts = [p.strip() for p in re.split(r"\s+-\s+|\s*/\s*", str(area_name or "")) if p.strip()]
+    return " - ".join(_sector_apply_abbrev(p, _SECTOR_AREA_ABBREV) for p in parts if p)
+
+
+def _sector_load_malha_indexed(contrato_id: str) -> Optional[Tuple[gpd.GeoDataFrame, STRtree, List[Any]]]:
+    cid = str(contrato_id or "").lower().strip()
+    if not cid:
+        return None
+    with _MALHA_BAIRRO_LOCK:
+        cached = _MALHA_BAIRRO_CACHE.get(cid)
+        if cached is not None:
+            return cached
+
+    path = malha_rotas.arquivo_malha(cid, tipo="TRANSITAVEIS") or malha_rotas.arquivo_malha(cid, tipo="COMPLETA")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        gdf = gpd.read_file(path)
+    except Exception:
+        return None
+    if "BAIRRO" not in gdf.columns:
+        return None
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:31985", allow_override=True)
+    elif gdf.crs.to_epsg() != 31985:
+        gdf = gdf.to_crs("EPSG:31985")
+    for col in ("NU", "FCU", "AGLOM", "name", "highway", "BAIRRO"):
+        if col not in gdf.columns:
+            gdf[col] = ""
+    geoms_list = list(gdf.geometry)
+    tree = STRtree(geoms_list)
+    bundle = (gdf, tree, geoms_list)
+    with _MALHA_BAIRRO_LOCK:
+        _MALHA_BAIRRO_CACHE[cid] = bundle
+    return bundle
+
+
+def _sector_compose_labels(enriched_segments: List[Dict[str, Any]]) -> List[str]:
+    coll = [s for s in enriched_segments if s.get("is_collection")]
+    if not coll:
+        return []
+    bairro_total: Dict[str, float] = defaultdict(float)
+    bairro_rest_total: Dict[str, float] = defaultdict(float)
+    bairro_rest_av: Dict[str, float] = defaultdict(float)
+    sub_total: Dict[str, float] = defaultdict(float)
+    sub_parent_b: Dict[str, Set[str]] = defaultdict(set)
+    av_total: Dict[str, float] = defaultdict(float)
+    av_bairro: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for seg in coll:
+        ln = float(seg.get("length_m") or 0.0)
+        b = seg.get("bairro") or ""
+        subs = seg.get("subdivisions") or []
+        nm = seg.get("name") or ""
+        hw = str(seg.get("highway") or "").lower()
+        is_av = (hw in _SECTOR_AVENUE_HW) or _sector_normalize_label(nm).startswith("AVENIDA ")
+
+        if b:
+            bairro_total[b] += ln
+            if not subs:
+                bairro_rest_total[b] += ln
+                if is_av:
+                    bairro_rest_av[b] += ln
+        for sn, _ in subs:
+            sub_total[sn] += ln
+            if b:
+                sub_parent_b[sn].add(b)
+        if is_av and nm:
+            av_total[nm] += ln
+            if b:
+                av_bairro[nm][b] += ln
+
+    bairro_cands: Dict[str, float] = {}
+    for b, total in bairro_total.items():
+        rest = bairro_rest_total.get(b, 0.0)
+        if total > 0 and (rest / total) < 0.1:
+            continue
+        if rest > 0 and (bairro_rest_av.get(b, 0.0) / rest) >= 0.9:
+            continue
+        if rest > 0:
+            bairro_cands[b] = rest
+
+    av_cands: Dict[str, float] = {}
+    for nm, total in av_total.items():
+        in_mixed = sum(av_bairro[nm].get(b, 0.0) for b in bairro_cands)
+        if total > 0 and (in_mixed / total) >= 0.9:
+            continue
+        av_cands[nm] = total
+
+    all_lens = list(bairro_cands.values()) + list(sub_total.values()) + list(av_cands.values())
+    if not all_lens:
+        return []
+    thr = 0.15 * max(all_lens)
+
+    princ_b = {b for b, v in bairro_cands.items() if v >= thr}
+    princ_s = {s for s, v in sub_total.items() if v >= thr}
+    princ_a = {a for a, v in av_cands.items() if v >= thr}
+
+    covered_b: Set[str] = set()
+    for s in princ_s:
+        s_lbl = _sector_area_to_label(s)
+        for pb in sub_parent_b.get(s, ()):
+            b_lbl = _sector_area_to_label(pb)
+            if b_lbl and re.search(rf"(^|\s){re.escape(b_lbl)}($|\s)", s_lbl):
+                covered_b.add(pb)
+
+    emitted: Set[str] = set()
+    labels: List[str] = []
+    for seg in sorted(coll, key=lambda x: x.get("seq_id", 0)):
+        nm = seg.get("name") or ""
+        if nm in princ_a:
+            tok = _sector_apply_abbrev(nm, _SECTOR_STREET_ABBREV)
+            if tok and tok not in emitted:
+                emitted.add(tok)
+                labels.append(tok)
+        for sn, _ in (seg.get("subdivisions") or []):
+            if sn in princ_s:
+                tok = _sector_area_to_label(sn)
+                if tok and tok not in emitted:
+                    emitted.add(tok)
+                    labels.append(tok)
+        b = seg.get("bairro") or ""
+        if b in princ_b and b not in covered_b:
+            tok = _sector_area_to_label(b)
+            if tok and tok not in emitted:
+                emitted.add(tok)
+                labels.append(tok)
+    return labels
+
+
+def _sector_build_full_name(contrato: str, nickname: str, labels: List[str]) -> str:
+    nick_up = str(nickname or "").strip().upper()
+    m = re.match(r"^([A-ZÀ-Ÿ]+)(?:\s+(\d+))?(?:\s+(.*))?$", nick_up)
+    if m:
+        prefix, num, raw_suf = m.group(1), m.group(2), m.group(3)
+        head_parts = [f"{prefix} {num}" if num else prefix]
+        if raw_suf:
+            head_parts.append(re.sub(r"\s+", " ", raw_suf.strip()))
+        head = f"{contrato} - {' '.join(head_parts)}"
+    else:
+        head = f"{contrato} - {nick_up}"
+
+    seen: Set[str] = set()
+    uniq: List[str] = []
+    for lbl in labels:
+        if lbl and lbl not in seen:
+            seen.add(lbl)
+            uniq.append(lbl)
+    while uniq:
+        cand = head + " - " + " - ".join(uniq)
+        if len(cand) <= _SECTOR_NAME_MAX_LEN:
+            return cand
+        uniq.pop()
+    return head[:_SECTOR_NAME_MAX_LEN]
+
+
+def _sector_detectar_turno(contrato_id: str, setor_codigo: str) -> str:
+    """Detecta turno (DIURNO/NOTURNO) olhando primeiro Rotas Planejadas e depois o prefixo."""
+    cid = str(contrato_id or "").lower().strip()
+    setor_norm = _norm_txt(setor_codigo)
+    try:
+        base_dir = malha_rotas.PASTA_ROTAS
+        if os.path.isdir(base_dir):
+            for entry in os.listdir(base_dir):
+                eu = _norm_txt(entry)
+                if not eu.startswith(_norm_txt(cid.replace("_", " "))):
+                    continue
+                rotas_dir = os.path.join(base_dir, entry, "rotas")
+                if not os.path.isdir(rotas_dir):
+                    continue
+                for fn in os.listdir(rotas_dir):
+                    if fn.lower().endswith(".gpkg") and _norm_txt(os.path.splitext(fn)[0]) == setor_norm:
+                        if "NOTURN" in eu:
+                            return "NOTURNO"
+                        if "DIURN" in eu:
+                            return "DIURNO"
+    except Exception:
+        pass
+    pref_m = re.match(r"^(SC[A-Z]*)", setor_norm)
+    pref = pref_m.group(1) if pref_m else ""
+    if pref.endswith(("N", "V")) and not pref.startswith("SCDOM"):
+        return "NOTURNO"
+    return "DIURNO"
+
+
+def _sector_format_frequency(setor_codigo: str, turno: str) -> str:
+    nick = str(setor_codigo or "").strip().upper()
+    m = re.match(r"^(SC[A-Z]*)(?:\s+(\d+))?(?:\s+(.*))?$", nick)
+    days: Set[int] = set()
+    if m:
+        pref = m.group(1) or ""
+        suffix = (m.group(3) or "").strip()
+        if suffix:
+            # Ranges "SEG A SEX"
+            for mr in re.finditer(r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\s*A\s*(SEG|TER|QUA|QUI|SEX|SAB|DOM)\b", suffix):
+                d1, d2 = _SECTOR_WEEKDAY_MAP[mr.group(1)], _SECTOR_WEEKDAY_MAP[mr.group(2)]
+                for d in range(d1, d2 + 1):
+                    days.add(d)
+            cleaned = _SECTOR_ORDINAL_RE.sub("", re.sub(r"\b(SEG|TER|QUA|QUI|SEX|SAB|DOM)\s*A\s*(SEG|TER|QUA|QUI|SEX|SAB|DOM)\b", "", suffix))
+            for md in _SECTOR_WEEKDAY_RE.finditer(cleaned):
+                days.add(_SECTOR_WEEKDAY_MAP[md.group(1)])
+            if not days:
+                for md in _SECTOR_WEEKDAY_RE.finditer(suffix):
+                    days.add(_SECTOR_WEEKDAY_MAP[md.group(1)])
+        if not days:
+            base = pref if pref.startswith(("SCDOM", "SCDIST")) else re.sub(r"[DNVM]$", "", pref)
+            if base.startswith("SCDOM"):
+                days = {6}
+            elif base.startswith("SCD"):
+                days = {0, 1, 2, 3, 4, 5}
+            elif base.startswith("SCP"):
+                days = {0, 2, 4}
+            elif base.startswith("SCI"):
+                days = {1, 3, 5}
+
+    fs = frozenset(days)
+    if fs == frozenset({0, 1, 2, 3, 4, 5}) or fs == frozenset({0, 1, 2, 3, 4, 5, 6}):
+        return f"DIARIO - {turno}"
+    if fs == frozenset({0, 2, 4}):
+        return f"SEG/QUA/SEX - {turno}"
+    if fs == frozenset({1, 3, 5}):
+        return f"TER/QUI/SAB - {turno}"
+    sd = sorted(days)
+    if len(sd) == 1:
+        d_str = "DOMINGO" if sd[0] == 6 else _SECTOR_CODE_TO_DAY[sd[0]]
+        return f"{d_str} - {turno}"
+    if len(sd) == 2:
+        return f"{_SECTOR_CODE_TO_DAY[sd[0]]} E {_SECTOR_CODE_TO_DAY[sd[1]]} - {turno}"
+    if len(sd) >= 3 and all(sd[i + 1] - sd[i] == 1 for i in range(len(sd) - 1)):
+        return f"{_SECTOR_CODE_TO_DAY[sd[0]]} A {_SECTOR_CODE_TO_DAY[sd[-1]]} - {turno}"
+    if sd:
+        return "/".join(_SECTOR_CODE_TO_DAY[d] for d in sd) + f" - {turno}"
+    return f"DIARIO - {turno}"
+
+
+def _sector_cluster_segments(geoms: List[Any]) -> List[List[int]]:
+    n = len(geoms)
+    if n == 0:
+        return []
+    coords = np.empty((n, 2), dtype=float)
+    for i, gm in enumerate(geoms):
+        c = gm.interpolate(0.5, normalized=True)
+        coords[i, 0], coords[i, 1] = c.x, c.y
+
+    if n < 2:
+        buffer_r = _SECTOR_CLUSTER_BUFFER_MIN
+    else:
+        k = min(_SECTOR_CLUSTER_BUFFER_KNN, n - 1)
+        diffs = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        dmat = np.sqrt(np.sum(diffs ** 2, axis=2))
+        np.fill_diagonal(dmat, np.inf)
+        knn_d = np.partition(dmat, k - 1, axis=1)[:, k - 1]
+        med_nn = float(np.median(knn_d))
+        buffer_r = float(np.clip(med_nn * _SECTOR_CLUSTER_BUFFER_MULT, _SECTOR_CLUSTER_BUFFER_MIN, _SECTOR_CLUSTER_BUFFER_MAX))
+
+    merged = unary_union([gm.buffer(buffer_r) for gm in geoms])
+    if isinstance(merged, Polygon):
+        regions = [merged]
+    elif isinstance(merged, MultiPolygon):
+        regions = list(merged.geoms)
+    else:
+        regions = [g for g in getattr(merged, "geoms", []) if isinstance(g, Polygon)]
+
+    prepped = [prep(r) for r in regions]
+    clusters: List[List[int]] = [[] for _ in regions]
+    for idx, gm in enumerate(geoms):
+        c = gm.interpolate(0.5, normalized=True)
+        assigned = False
+        for ri, pr in enumerate(prepped):
+            if pr.contains(c):
+                clusters[ri].append(idx)
+                assigned = True
+                break
+        if not assigned and regions:
+            best_ri = min(range(len(regions)), key=lambda ri: regions[ri].exterior.distance(c))
+            clusters[best_ri].append(idx)
+
+    clusters = [cl for cl in clusters if cl]
+    large = [cl for cl in clusters if len(cl) >= _SECTOR_MIN_ADAPTIVE_CLUSTER]
+    small = [cl for cl in clusters if len(cl) < _SECTOR_MIN_ADAPTIVE_CLUSTER]
+    if large and small:
+        l_cx = [(sum(geoms[i].interpolate(0.5, normalized=True).x for i in cl) / len(cl),
+                 sum(geoms[i].interpolate(0.5, normalized=True).y for i in cl) / len(cl)) for cl in large]
+        res_map = {i: list(cl) for i, cl in enumerate(large)}
+        for sc in small:
+            sx = sum(geoms[i].interpolate(0.5, normalized=True).x for i in sc) / len(sc)
+            sy = sum(geoms[i].interpolate(0.5, normalized=True).y for i in sc) / len(sc)
+            best_li = min(range(len(large)), key=lambda li: math.hypot(sx - l_cx[li][0], sy - l_cx[li][1]))
+            res_map[best_li].extend(sc)
+        clusters = list(res_map.values())
+
+    clusters.sort(key=lambda cl: (-len(cl), cl[0]))
+    return clusters
+
+
+def _sector_ensure_polygon(geom: Any) -> Optional[Any]:
+    if geom is None or geom.is_empty:
+        return None
+    if isinstance(geom, (Polygon, MultiPolygon)):
+        return geom
+    polys = [g for g in getattr(geom, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
+    if not polys:
+        return None
+    return polys[0] if len(polys) == 1 else MultiPolygon(polys)
+
+
+def _sector_draw(cluster_geoms: List[Any], style: str) -> Optional[Any]:
+    buffered = [gm.buffer(_SECTOR_BUFFER_MARGIN, cap_style="round", join_style="round", resolution=_SECTOR_BUFFER_RES) for gm in cluster_geoms]
+    base = _sector_ensure_polygon(unary_union(buffered))
+    if base is None:
+        return None
+    if style != "streets":
+        if isinstance(base, Polygon):
+            base = Polygon(base.exterior)
+        elif isinstance(base, MultiPolygon):
+            base = MultiPolygon([Polygon(p.exterior) for p in base.geoms])
+    simp = make_valid(base.simplify(_SECTOR_SIMPLIFY_TOL, preserve_topology=True))
+    res = _sector_ensure_polygon(simp)
+    if res is None:
+        return None
+    if isinstance(res, MultiPolygon):
+        parts = [p for p in res.geoms if p.area >= 1.0]
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else MultiPolygon(parts)
+    return res if res.area >= 1.0 else None
+
+
+def gerar_shapefile_setor_zip(
+    gpkg_bytes: bytes,
+    contrato_id: str,
+    setor_codigo: str,
+    macro_setor: Optional[str] = None,
+    setor_descricao_fallback: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Gera o Shapefile (.zip) do polígono de setor compatível com GIS Eyes (clientetvt4.exe)
+    e padrão GARANHUNS_-_NOTURNO.zip (`Setor - <APELIDO>.shp` com UTF-8 e EPSG:4326).
+    """
+    cid = str(contrato_id or "").lower().strip()
+    cid_key = cid.replace("_", " ")
+    cfg = CONTRATOS_SETORES_CFG.get(cid) or CONTRATOS_SETORES_CFG.get(cid_key)
+    contract_code, style, contract_name = cfg if cfg else ("000", "area", cid_key.upper() or "CONTRATO")
+
+    base_nick = _safe_filename(setor_codigo, "SETOR")
+    turno = _sector_detectar_turno(cid, base_nick)
+    pasta_contrato = f"{contract_name} - {turno}"
+    macro_str = (str(macro_setor or "").strip() or f"{contract_name} - DOMICILIAR").upper()
+
+    with tempfile.TemporaryDirectory(prefix="gpkg_setor_") as tmpdir:
+        in_gpkg = os.path.join(tmpdir, "input_rota.gpkg")
+        with open(in_gpkg, "wb") as f:
+            f.write(gpkg_bytes)
+        gdf_orig = gpd.read_file(in_gpkg)
+        if gdf_orig.empty:
+            raise ValueError("Arquivo .gpkg está vazio.")
+
+        if gdf_orig.crs is None:
+            gdf_31985 = gdf_orig.set_crs("EPSG:31985", allow_override=True)
+        elif gdf_orig.crs.to_epsg() != 31985:
+            gdf_31985 = gdf_orig.to_crs("EPSG:31985")
+        else:
+            gdf_31985 = gdf_orig.copy()
+
+        # Deduplicação por par (u, v) não dirigido e extração das linhas válidas
+        seen_uv: Set[Tuple[int, int]] = set()
+        geoms_31985: List[Any] = []
+        seg_meta: List[Tuple[int, bool]] = []
+        seq_counter = 0
+
+        for _, row in gdf_31985.iterrows():
+            gm = row.geometry
+            if gm is None or gm.is_empty:
+                continue
+            u_i = _parse_int_or_none(row.get("u"))
+            v_i = _parse_int_or_none(row.get("v"))
+            if u_i is not None and v_i is not None:
+                ek = (min(u_i, v_i), max(u_i, v_i))
+                if ek in seen_uv:
+                    continue
+                seen_uv.add(ek)
+
+            # Extrai LineString simples se for MultiLineString
+            lines = list(gm.geoms) if gm.geom_type == "MultiLineString" else ([gm] if gm.geom_type == "LineString" else [])
+            if not lines:
+                continue
+            line_gm = max(lines, key=lambda l: l.length) if len(lines) > 1 else lines[0]
+
+            seq_counter += 1
+            sq = _parse_int_or_none(row.get("seq_id"))
+            is_col = _extrair_tipo_aresta(row.to_dict()) != "DESLOCAMENTO"
+
+            geoms_31985.append(line_gm)
+            seg_meta.append((sq if sq is not None else seq_counter, is_col))
+
+        if not geoms_31985:
+            raise ValueError("Nenhuma geometria de linha válida encontrada no .gpkg para gerar o setor.")
+
+        # Enriquecimento com Bairros e composição do campo SETOR completo
+        setor_full = ""
+        bairros_labels: List[str] = []
+        malha_bundle = _sector_load_malha_indexed(cid)
+        if malha_bundle is not None:
+            gdf_malha, tree, geoms_malha = malha_bundle
+            enriched_segs: List[Dict[str, Any]] = []
+            for idx_g, (gm, (sq_v, is_c)) in enumerate(zip(geoms_31985, seg_meta)):
+                mid = gm.interpolate(0.5, normalized=True)
+                n_idx = int(tree.nearest(mid))
+                mrow = gdf_malha.iloc[n_idx]
+                subs = []
+                for col_s in ("NU", "FCU", "AGLOM"):
+                    sv = _sector_safe_str(mrow.get(col_s))
+                    if sv:
+                        subs.append((sv, col_s))
+                enriched_segs.append({
+                    "seq_id": sq_v,
+                    "is_collection": is_c,
+                    "bairro": _sector_safe_str(mrow.get("BAIRRO")),
+                    "subdivisions": subs,
+                    "name": _sector_safe_str(mrow.get("name")),
+                    "highway": _sector_safe_str(mrow.get("highway")).lower(),
+                    "length_m": float(gm.length),
+                })
+            bairros_labels = _sector_compose_labels(enriched_segs)
+            if bairros_labels:
+                setor_full = _sector_build_full_name(contract_name, base_nick, bairros_labels)
+
+        if not setor_full:
+            setor_full = str(setor_descricao_fallback or f"{contract_name} - {base_nick}").upper()
+
+        m_code = re.search(r"(\d+)\s*$", base_nick) or re.search(r"(\d+)", base_nick)
+        num_code = m_code.group(1) if m_code else "0"
+        identifier = f"{contract_code}{num_code}"
+        frequency = _sector_format_frequency(base_nick, turno)
+
+        clusters = _sector_cluster_segments(geoms_31985)
+        n_clusters = len(clusters)
+        feat_rows: List[Dict[str, Any]] = []
+        for cl_idx, cl_indices in enumerate(clusters, start=1):
+            poly = _sector_draw([geoms_31985[i] for i in cl_indices], style)
+            if poly is None:
+                continue
+            if isinstance(poly, Polygon):
+                poly = MultiPolygon([poly])
+            feat_rows.append({
+                "SETOR": setor_full,
+                "APELIDO": base_nick,
+                "IDENTIF": identifier,
+                "FREQUENCIA": frequency,
+                "MACRO": macro_str,
+                "contract": contract_name,
+                "code": num_code,
+                "cluster": int(cl_idx),
+                "n_clusters": int(n_clusters),
+                "n_segs": int(len(cl_indices)),
+                "geometry": poly,
+            })
+
+        if not feat_rows:
+            raise ValueError("Nenhuma geometria poligonal pôde ser gerada para o setor.")
+
+        gdf_out = gpd.GeoDataFrame(feat_rows, geometry="geometry", crs="EPSG:31985").to_crs("EPSG:4326")
+        out_dir = os.path.join(tmpdir, pasta_contrato)
+        os.makedirs(out_dir, exist_ok=True)
+        shp_stem = f"Setor - {base_nick}"
+        shp_path = os.path.join(out_dir, f"{shp_stem}.shp")
+        gdf_out.to_file(shp_path, driver="ESRI Shapefile", encoding="utf-8")
+
+        with open(os.path.join(out_dir, f"{shp_stem}.cpg"), "wb") as fc:
+            fc.write(b"UTF-8")
+        with open(os.path.join(out_dir, f"{shp_stem}.prj"), "wb") as fp:
+            fp.write(WGS84_PRJ.encode("ascii"))
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{pasta_contrato}/", b"")
+            for ext in (".cpg", ".dbf", ".prj", ".shp", ".shx"):
+                fpath = os.path.join(out_dir, f"{shp_stem}{ext}")
+                if os.path.isfile(fpath):
+                    zf.write(fpath, arcname=f"{pasta_contrato}/{shp_stem}{ext}")
+
+        return {
+            "zip_bytes": zip_buf.getvalue(),
+            "zip_filename": f"Setor - {base_nick}.zip",
+            "shp_stem": shp_stem,
+            "pasta_contrato": pasta_contrato,
+            "resumo": {
+                "setor": setor_full,
+                "apelido": base_nick,
+                "identif": identifier,
+                "frequencia": frequency,
+                "macro": macro_str,
+                "estilo": style,
+                "turno": turno,
+                "clusters": n_clusters,
+                "segmentos": len(geoms_31985),
+                "feicoes_shp": len(feat_rows),
+                "operacao_giseyes": "DOMICILIAR F2" if cid == "cuiaba" else "DOMICILIAR F1",
+            },
+        }
+
+
+# ==============================================================================
+# AUTOMAÇÃO DESKTOP DO GIS EYES (clientetvt4.exe)
+# ==============================================================================
+def localizar_clientetvt4_exe() -> Optional[str]:
+    """Localiza o executável clientetvt4.exe instalado nesta máquina Windows."""
+    candidatos = [
+        os.getenv("GISEYES_EXE_PATH", "").strip(),
+        os.path.join(os.path.expanduser("~"), "Downloads", "GisEyes", "GisEyes", "clientetvt4.exe"),
+        os.path.join(os.path.expanduser("~"), "Downloads", "FS - DIE", "FS - DIE", "GisEyes", "clientetvt4.exe"),
+        r"C:\GisEyes\clientetvt4.exe",
+        r"C:\Program Files (x86)\GisEyes\clientetvt4.exe",
+        r"C:\Program Files\GisEyes\clientetvt4.exe",
+    ]
+    for p in candidatos:
+        if p and os.path.isfile(p):
+            return p
+    for pattern in (
+        os.path.join(os.path.expanduser("~"), "Downloads", "**", "clientetvt4.exe"),
+        os.path.join(os.path.expanduser("~"), "Desktop", "**", "clientetvt4.exe"),
+    ):
+        for p in glob.iglob(pattern, recursive=True):
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def atualizar_setor_clientetvt4(
+    zip_setor_bytes: bytes,
+    contrato_id: str,
+    empresa: str = GISEYES_DEFAULT_EMPRESA,
+    usuario: str = GISEYES_DEFAULT_USER,
+    senha: str = GISEYES_DEFAULT_PASS,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Abre o clientetvt4.exe (GIS Eyes), faz login, abre Cadastros -> GIS -> Importador,
+    carrega o Shapefile do setor, mapeia os combos (DOMICILIAR F2 para Cuiabá, DOMICILIAR F1
+    para as demais cidades) e executa Processar para substituir o setor no servidor.
+    """
+    def _log(msg: str) -> None:
+        if log_cb:
+            log_cb(msg)
+
+    if os.name != "nt" or sys.platform != "win32":
+        raise RuntimeError(
+            "O GIS Eyes (clientetvt4.exe) é um aplicativo Windows desktop e não pode ser executado neste servidor. "
+            "Baixe o arquivo Shape Setor (.zip) gerado para importar localmente."
+        )
+
+    exe_path = localizar_clientetvt4_exe()
+    if not exe_path:
+        raise FileNotFoundError(
+            "Executável 'clientetvt4.exe' não encontrado no PC. "
+            "Configure GISEYES_EXE_PATH ou mantenha o GIS Eyes na pasta Downloads."
+        )
+
+    cid = str(contrato_id or "").lower().strip()
+    operacao_nome = "DOMICILIAR F2" if cid == "cuiaba" else "DOMICILIAR F1"
+    operacao_idx = 14 if cid == "cuiaba" else 0
+
+    user32 = ctypes.windll.user32
+    WNDENUMPROC = ctypes.WINFUNCTYPE(_wt.BOOL, _wt.HWND, _wt.LPARAM)
+    WM_SETTEXT = 0x000C
+    WM_GETTEXT = 0x000D
+    WM_GETTEXTLENGTH = 0x000E
+    WM_CHAR = 0x0102
+    WM_LBUTTONDOWN = 0x0201
+    WM_LBUTTONUP = 0x0202
+    WM_MOUSEMOVE = 0x0200
+    WM_KEYDOWN = 0x0100
+    WM_KEYUP = 0x0101
+    WM_COMMAND = 0x0111
+    VK_UP = 0x26
+    VK_DOWN = 0x28
+
+    def _get_text(hwnd: int) -> str:
+        ln = user32.SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+        b = ctypes.create_unicode_buffer(max(256, ln + 2))
+        user32.SendMessageW(hwnd, WM_GETTEXT, len(b), ctypes.byref(b))
+        return b.value
+
+    def _get_cls(hwnd: int) -> str:
+        b = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, b, 256)
+        return b.value
+
+    def _get_rect(hwnd: int) -> Tuple[int, int, int, int]:
+        rc = _wt.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rc))
+        return (rc.left, rc.top, rc.right, rc.bottom)
+
+    def _click(hwnd: int, x: Optional[int] = None, y: Optional[int] = None) -> None:
+        rc = _get_rect(hwnd)
+        cx = max(4, (rc[2] - rc[0]) // 2) if x is None else x
+        cy = max(4, (rc[3] - rc[1]) // 2) if y is None else y
+        lparam = (cy << 16) | (cx & 0xFFFF)
+        user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam)
+        time.sleep(0.05)
+        user32.PostMessageW(hwnd, WM_LBUTTONDOWN, 1, lparam)
+        time.sleep(0.05)
+        user32.PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam)
+
+    def _type_edit(hwnd: int, text: str) -> None:
+        user32.SendMessageW(hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p(""))
+        for _ in range(30):
+            user32.SendMessageW(hwnd, WM_CHAR, 0x08, 0)
+        for ch in text:
+            user32.SendMessageW(hwnd, WM_CHAR, ord(ch), 0)
+
+    def _find_popup_datalist(pid: int) -> Tuple[Optional[int], Optional[Tuple[int, int, int, int]]]:
+        found: List[Tuple[int, Tuple[int, int, int, int]]] = []
+        def _cb(hwnd, _lp):
+            p = _wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+            if p.value == pid and user32.IsWindowVisible(hwnd) and _get_cls(hwnd) == "TbsPopupDataList":
+                found.append((hwnd, _get_rect(hwnd)))
+            return True
+        user32.EnumWindows(WNDENUMPROC(_cb), 0)
+        return found[0] if found else (None, None)
+
+    def _select_combo_index(pid: int, combo_hwnd: int, target_index: int) -> None:
+        rc = _get_rect(combo_hwnd)
+        w, h = rc[2] - rc[0], rc[3] - rc[1]
+        _click(combo_hwnd, w - 10, h // 2)
+        time.sleep(0.30)
+        pop_hwnd, _ = _find_popup_datalist(pid)
+        if pop_hwnd:
+            _click(pop_hwnd, 40, 10)
+            time.sleep(0.20)
+        for _ in range(35):
+            user32.SendMessageW(combo_hwnd, WM_KEYDOWN, VK_UP, 0)
+            user32.SendMessageW(combo_hwnd, WM_KEYUP, VK_UP, 0)
+        for _ in range(target_index):
+            user32.SendMessageW(combo_hwnd, WM_KEYDOWN, VK_DOWN, 0)
+            user32.SendMessageW(combo_hwnd, WM_KEYUP, VK_DOWN, 0)
+        time.sleep(0.15)
+
+    with tempfile.TemporaryDirectory(prefix="giseves_imp_") as tmpdir:
+        with zipfile.ZipFile(io.BytesIO(zip_setor_bytes)) as zf:
+            zf.extractall(tmpdir)
+        shp_files = list(glob.iglob(os.path.join(tmpdir, "**", "*.shp"), recursive=True))
+        if not shp_files:
+            raise RuntimeError("Nenhum arquivo .shp encontrado dentro do ZIP do setor.")
+        shp_path = shp_files[0]
+        gdf_meta = gpd.read_file(shp_path, rows=1)
+        dbf_cols = [c for c in gdf_meta.columns if c != "geometry"]
+
+        def _col_rev_idx(col_name: str) -> int:
+            if col_name not in dbf_cols:
+                raise RuntimeError(f"Coluna '{col_name}' ausente no Shapefile de setor gerado.")
+            return len(dbf_cols) - 1 - dbf_cols.index(col_name)
+
+        _log(f"🖥️ Abrindo GIS Eyes ({os.path.basename(exe_path)}) e conectando como {empresa}/{usuario}...")
+        proc: Optional[subprocess.Popen] = None
+        try:
+            proc = subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
+            pid = proc.pid
+
+            # 1. Aguardar tela de Login (TfrmLoginSistema)
+            login_hwnd = None
+            main_hwnd = None
+            for _ in range(40):
+                if proc.poll() is not None:
+                    raise RuntimeError("clientetvt4.exe encerrou inesperadamente durante a abertura.")
+                time.sleep(1.0)
+                def _find_login(hwnd, _lp):
+                    nonlocal login_hwnd, main_hwnd
+                    p = _wt.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                    if p.value != pid:
+                        return True
+                    cls = _get_cls(hwnd)
+                    if cls == "TfrmPricipalClienteTVT4" and user32.IsWindowVisible(hwnd):
+                        main_hwnd = hwnd
+                    elif cls == "TfrmLoginSistema" and user32.IsWindowVisible(hwnd):
+                        login_hwnd = hwnd
+                    return True
+                user32.EnumWindows(WNDENUMPROC(_find_login), 0)
+                if login_hwnd and main_hwnd:
+                    break
+
+            if not login_hwnd or not main_hwnd:
+                raise RuntimeError("Tempo esgotado aguardando a tela de login (Entrada de Usuários) do GIS Eyes.")
+
+            l_children: List[Tuple[int, str, str, Tuple[int, int, int, int]]] = []
+            def _enum_login(ch, _lp):
+                l_children.append((ch, _get_cls(ch), _get_text(ch), _get_rect(ch)))
+                return True
+            user32.EnumChildWindows(login_hwnd, WNDENUMPROC(_enum_login), 0)
+            edits = sorted([c for c in l_children if c[1] == "TbsSkinEdit"], key=lambda x: x[3][1])
+            pwds = [c for c in l_children if c[1] == "TbsSkinPasswordEdit"]
+            ok_btns = [c for c in l_children if c[1] == "TbsSkinButton" and "OK" in c[2].upper()]
+            if len(edits) < 2 or not pwds or not ok_btns:
+                raise RuntimeError("Controles da tela de login do GIS Eyes não reconhecidos.")
+
+            _type_edit(edits[0][0], empresa)
+            _type_edit(edits[1][0], usuario)
+            _type_edit(pwds[0][0], senha)
+            _click(ok_btns[0][0])
+
+            # 2. Aguardar conclusão do login e sumiço de TfrmAguarde
+            logged_ok = False
+            for _ in range(30):
+                time.sleep(1.0)
+                st_texts: List[str] = []
+                def _enum_st(ch, _lp):
+                    if _get_cls(ch) == "TbsSkinStatusPanel":
+                        st_texts.append(_get_text(ch))
+                    return True
+                user32.EnumChildWindows(main_hwnd, WNDENUMPROC(_enum_st), 0)
+                aguarde_or_login = False
+                err_popups: List[Tuple[int, str]] = []
+                def _chk_wait(hwnd, _lp):
+                    nonlocal aguarde_or_login
+                    p = _wt.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                    if p.value != pid or not user32.IsWindowVisible(hwnd):
+                        return True
+                    cls = _get_cls(hwnd)
+                    if cls in ("TfrmAguarde", "TfrmLoginSistema"):
+                        aguarde_or_login = True
+                    elif cls == "TbsMessageForm":
+                        err_popups.append((hwnd, _get_text(hwnd)))
+                    return True
+                user32.EnumWindows(WNDENUMPROC(_chk_wait), 0)
+                if err_popups:
+                    raise RuntimeError(f"GIS Eyes exibiu alerta no login: {err_popups[0][1]}")
+                if not aguarde_or_login and any("LOCAR" in t.upper() for t in st_texts):
+                    logged_ok = True
+                    break
+
+            if not logged_ok:
+                raise RuntimeError("Login no GIS Eyes não completou dentro do tempo limite.")
+
+            _log(f"🔓 Login no GIS Eyes concluído ({empresa}/{usuario}). Abrindo Cadastros -> GIS -> Importador...")
+            time.sleep(0.8)
+
+            # 3. Abrir Cadastros -> GIS -> Importador
+            menubar_hwnd = None
+            def _find_menu(ch, _lp):
+                nonlocal menubar_hwnd
+                if _get_cls(ch) == "TbsSkinMainMenuBar":
+                    menubar_hwnd = ch
+                return True
+            user32.EnumChildWindows(main_hwnd, WNDENUMPROC(_find_menu), 0)
+            if not menubar_hwnd:
+                raise RuntimeError("Barra de menu principal do GIS Eyes não localizada.")
+
+            _click(menubar_hwnd, 70, 10)
+            time.sleep(0.7)
+            pop1 = None
+            pop1_rc = None
+            def _find_pop1(hwnd, _lp):
+                nonlocal pop1, pop1_rc
+                p = _wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                if p.value == pid and user32.IsWindowVisible(hwnd) and _get_cls(hwnd) == "TbsSkinPopupWindow":
+                    pop1 = hwnd
+                    pop1_rc = _get_rect(hwnd)
+                return True
+            user32.EnumWindows(WNDENUMPROC(_find_pop1), 0)
+            if not pop1 or not pop1_rc:
+                raise RuntimeError("Menu 'Cadastros' do GIS Eyes não abriu.")
+
+            _click(pop1, (pop1_rc[2] - pop1_rc[0]) // 2, int((pop1_rc[3] - pop1_rc[1]) * 5.5 / 8))
+            time.sleep(0.7)
+
+            pop2 = None
+            pop2_rc = None
+            def _find_pop2(hwnd, _lp):
+                nonlocal pop2, pop2_rc
+                p = _wt.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                if p.value == pid and user32.IsWindowVisible(hwnd) and _get_cls(hwnd) == "TbsSkinPopupWindow" and hwnd != pop1:
+                    pop2 = hwnd
+                    pop2_rc = _get_rect(hwnd)
+                return True
+            user32.EnumWindows(WNDENUMPROC(_find_pop2), 0)
+            if not pop2 or not pop2_rc:
+                raise RuntimeError("Submenu 'GIS' do GIS Eyes não abriu.")
+
+            _click(pop2, (pop2_rc[2] - pop2_rc[0]) // 2, 14)
+
+            # Aguardar TfrmImportadorShape e botões Abrir/Processar
+            btn_abrir = None
+            btn_processar = None
+            for _ in range(15):
+                time.sleep(0.5)
+                def _find_imp(ch, _lp):
+                    nonlocal btn_abrir, btn_processar
+                    if user32.IsWindowVisible(ch) and _get_cls(ch) == "TbsSkinButton":
+                        t = _get_text(ch)
+                        if t == "Abrir":
+                            btn_abrir = ch
+                        elif t == "Processar":
+                            btn_processar = ch
+                    return True
+                user32.EnumChildWindows(main_hwnd, WNDENUMPROC(_find_imp), 0)
+                if btn_abrir and btn_processar:
+                    break
+            if not btn_abrir or not btn_processar:
+                raise RuntimeError("Tela do Importador GIS não abriu corretamente.")
+
+            # 4. Clicar em Abrir e enviar o .shp no diálogo #32770
+            _click(btn_abrir)
+            dlg_hwnd = None
+            for _ in range(15):
+                time.sleep(0.5)
+                def _find_dlg(hwnd, _lp):
+                    nonlocal dlg_hwnd
+                    p = _wt.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                    if p.value == pid and user32.IsWindowVisible(hwnd) and _get_cls(hwnd) == "#32770" and _get_text(hwnd) == "Abrir":
+                        dlg_hwnd = hwnd
+                    return True
+                user32.EnumWindows(WNDENUMPROC(_find_dlg), 0)
+                if dlg_hwnd:
+                    break
+            if not dlg_hwnd:
+                raise RuntimeError("Diálogo 'Abrir' de arquivo do Windows não apareceu.")
+
+            edit_1148 = None
+            btn_1 = None
+            def _enum_dlg(ch, _lp):
+                nonlocal edit_1148, btn_1
+                cid_ctrl = user32.GetDlgCtrlID(ch)
+                ccls = _get_cls(ch)
+                if ccls == "Edit" and cid_ctrl == 1148:
+                    edit_1148 = ch
+                elif ccls == "Button" and cid_ctrl == 1:
+                    btn_1 = ch
+                return True
+            user32.EnumChildWindows(dlg_hwnd, WNDENUMPROC(_enum_dlg), 0)
+            if not edit_1148 or not btn_1:
+                raise RuntimeError("Campo de caminho do arquivo no diálogo Abrir não encontrado.")
+
+            user32.SendMessageW(edit_1148, WM_SETTEXT, 0, ctypes.c_wchar_p(shp_path))
+            time.sleep(0.25)
+            user32.SendMessageW(dlg_hwnd, WM_COMMAND, 1, btn_1)
+
+            # Aguardar diálogo fechar e Importador carregar o shapefile
+            loaded_shp = False
+            for _ in range(20):
+                time.sleep(0.5)
+                if not user32.IsWindowVisible(dlg_hwnd):
+                    titles: List[str] = []
+                    def _chk_imp(ch, _lp):
+                        if _get_cls(ch) == "TfrmImportadorShape":
+                            titles.append(_get_text(ch))
+                        return True
+                    user32.EnumChildWindows(main_hwnd, WNDENUMPROC(_chk_imp), 0)
+                    if any(".shp" in t.lower() for t in titles):
+                        loaded_shp = True
+                        break
+            if not loaded_shp:
+                time.sleep(1.5)
+
+            # 5. Mapear os 8 TbsSkinDBLookupComboBox da aba Setores
+            combos: List[Tuple[int, Tuple[int, int, int, int]]] = []
+            def _enum_combos(ch, _lp):
+                if user32.IsWindowVisible(ch) and _get_cls(ch) == "TbsSkinDBLookupComboBox":
+                    combos.append((ch, _get_rect(ch)))
+                return True
+            user32.EnumChildWindows(main_hwnd, WNDENUMPROC(_enum_combos), 0)
+            combos.sort(key=lambda x: x[1][1])
+            if len(combos) < 8:
+                raise RuntimeError(f"Esperados 8 combos na aba Setores, encontrados {len(combos)}.")
+
+            _log(f"⚙️ Mapeando colunas do setor e configurando Operação '{operacao_nome}' no GIS Eyes...")
+            _select_combo_index(pid, combos[0][0], _col_rev_idx("SETOR"))       # SETOR
+            _select_combo_index(pid, combos[1][0], 0)                            # TIPO DO SETOR -> DOMICILIAR
+            _select_combo_index(pid, combos[2][0], _col_rev_idx("APELIDO"))     # APELIDO
+            _select_combo_index(pid, combos[3][0], _col_rev_idx("IDENTIF"))     # IDENTIFICADOR
+            _select_combo_index(pid, combos[4][0], _col_rev_idx("FREQUENCIA"))  # FREQUENCIA
+            _select_combo_index(pid, combos[5][0], _col_rev_idx("MACRO"))       # MACRO SETOR
+            _select_combo_index(pid, combos[7][0], operacao_idx)                 # OPERACAO
+
+            # 6. Clicar em Processar e confirmar os diálogos TbsMessageForm
+            _log("🚀 Clicando em Processar no GIS Eyes para gravar o setor na base Inlog...")
+            _click(btn_processar)
+
+            mensagens_confirmadas: List[str] = []
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                time.sleep(0.8)
+                msgs_now: List[Tuple[int, str, Optional[int]]] = []
+                def _find_msgs(hwnd, _lp):
+                    p = _wt.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+                    if p.value == pid and user32.IsWindowVisible(hwnd) and _get_cls(hwnd) == "TbsMessageForm":
+                        ok_btn = None
+                        def _mb(ch, _lp2):
+                            nonlocal ok_btn
+                            if _get_cls(ch) == "TbsSkinButton" and _get_text(ch).upper() in ("OK", "SIM"):
+                                ok_btn = ch
+                            return True
+                        user32.EnumChildWindows(hwnd, WNDENUMPROC(_mb), 0)
+                        msgs_now.append((hwnd, _get_text(hwnd), ok_btn))
+                    return True
+                user32.EnumWindows(WNDENUMPROC(_find_msgs), 0)
+                if msgs_now:
+                    for m_hwnd, m_title, ok_btn in msgs_now:
+                        mensagens_confirmadas.append(m_title or "Informação")
+                        _log(f"💬 Diálogo GIS Eyes: '{m_title}' -> clicando OK...")
+                        if ok_btn:
+                            _click(ok_btn)
+                        else:
+                            user32.PostMessageW(m_hwnd, WM_KEYDOWN, 0x0D, 0)
+                    time.sleep(1.5)
+                    # Verifica se ainda há algum outro diálogo pertencente a este processo
+                    extra_open: List[int] = []
+                    def _chk_extra(hw, _lp):
+                        p2 = _wt.DWORD()
+                        user32.GetWindowThreadProcessId(hw, ctypes.byref(p2))
+                        if p2.value == pid and user32.IsWindowVisible(hw) and _get_cls(hw) == "TbsMessageForm":
+                            extra_open.append(hw)
+                        return True
+                    user32.EnumWindows(WNDENUMPROC(_chk_extra), 0)
+                    if not extra_open:
+                        break
+
+            if not mensagens_confirmadas:
+                raise RuntimeError("Tempo esgotado aguardando confirmação final após clicar em Processar no GIS Eyes.")
+
+            _log(f"✅ Setor atualizado com sucesso no GIS Eyes (Operação: {operacao_nome})!")
+            return {
+                "sucesso": True,
+                "operacao": operacao_nome,
+                "shp_arquivo": os.path.basename(shp_path),
+                "mensagens": mensagens_confirmadas,
+            }
+        finally:
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=4)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+
+# ==============================================================================
 # RÉPLICA EXATA DA LÓGICA GEOMÉTRICA DO ANGULARJS (index.controller.js + utils)
 # ==============================================================================
 def _is_inside_area_single(points: List[Dict[str, float]], lng: float, lat: float) -> bool:
@@ -1454,6 +2494,7 @@ def iniciar_job_publicacao_inlog(
     apelido_rota: str = "ROTA SUB",
     atualizar_local: bool = True,
     publicar_inlog: bool = True,
+    atualizar_setor_gis: bool = True,
     sol_id: Optional[str] = None,
     usuario_inlog: Optional[str] = None,
     senha_inlog: Optional[str] = None,
@@ -1477,11 +2518,13 @@ def iniciar_job_publicacao_inlog(
             "resultado": None,
             "zip_bytes": None,
             "zip_filename": None,
+            "zip_setor_bytes": None,
+            "zip_setor_filename": None,
         }
 
     def _runner():
         try:
-            _log_job(job_id, f"📦 Lendo .gpkg e convertendo para Shapefile ({setor_codigo})...")
+            _log_job(job_id, f"📦 Lendo .gpkg e convertendo para Shapefile da Rota ({setor_codigo})...")
             conv = converter_gpkg_para_shapefile_zip(
                 gpkg_bytes=gpkg_bytes,
                 contrato_id=contrato_id,
@@ -1495,22 +2538,53 @@ def iniciar_job_publicacao_inlog(
             resumo_conv = conv["resumo"]
             _atualizar_job(
                 job_id,
-                progresso=25,
+                progresso=18,
                 zip_bytes=conv["zip_bytes"],
                 zip_filename=conv["zip_filename"],
             )
             _log_job(
                 job_id,
-                f"✅ Shapefile '{conv['zip_filename']}' gerado: {resumo_conv['trechos_shapefile']} trechos "
+                f"✅ Shapefile Rota '{conv['zip_filename']}' gerado: {resumo_conv['trechos_shapefile']} trechos "
                 f"(Coleta {resumo_conv['km_coleta']} km + Desloc. {resumo_conv['km_deslocamento']} km; "
                 f"{resumo_conv['lacunas_preenchidas_malha']}/{resumo_conv['lacunas_detectadas']} lacunas roteirizadas).",
             )
+
+            _log_job(job_id, f"🗺️ Gerando Shapefile do Setor ({setor_codigo})...")
+            conv_setor = gerar_shapefile_setor_zip(
+                gpkg_bytes=conv["gpkg_corrigido_bytes"],
+                contrato_id=contrato_id,
+                setor_codigo=setor_codigo,
+                macro_setor=macro_setor,
+                setor_descricao_fallback=setor_descricao,
+            )
+            resumo_setor = conv_setor["resumo"]
+            _atualizar_job(
+                job_id,
+                progresso=28,
+                zip_setor_bytes=conv_setor["zip_bytes"],
+                zip_setor_filename=conv_setor["zip_filename"],
+            )
+            _log_job(
+                job_id,
+                f"✅ Shapefile Setor '{conv_setor['zip_filename']}' gerado: "
+                f"SETOR='{resumo_setor['setor']}' | IDENTIF={resumo_setor['identif']} | "
+                f"FREQ='{resumo_setor['frequencia']}' ({resumo_setor['clusters']} cluster(s)).",
+            )
+
+            res_gis = None
+            if atualizar_setor_gis:
+                res_gis = atualizar_setor_clientetvt4(
+                    zip_setor_bytes=conv_setor["zip_bytes"],
+                    contrato_id=contrato_id,
+                    log_cb=lambda m: _log_job(job_id, m),
+                )
+                _atualizar_job(job_id, progresso=48)
 
             res_local = None
             if atualizar_local and atualizar_local_fn:
                 _log_job(job_id, f"💾 Atualizando arquivo .gpkg em 'Rotas Planejadas' e reconstruindo malha de '{contrato_id}'...")
                 res_local = atualizar_local_fn(contrato_id, setor_codigo, conv["gpkg_corrigido_bytes"])
-                _atualizar_job(job_id, progresso=42)
+                _atualizar_job(job_id, progresso=60)
                 _log_job(
                     job_id,
                     f"✅ Sistema LC atualizado: {os.path.basename(res_local.get('arquivo_destino') or '')} salvo "
@@ -1521,17 +2595,17 @@ def iniciar_job_publicacao_inlog(
             if publicar_inlog:
                 client = InlogEditorRotasClient(log_cb=lambda m: _log_job(job_id, m))
                 client.login(usuario_inlog or INLOG_DEFAULT_USER, senha_inlog or INLOG_DEFAULT_PASS)
-                _atualizar_job(job_id, progresso=52)
+                _atualizar_job(job_id, progresso=66)
 
                 v_id, v_label = client.ativar_vinculo_cidade(contrato_id)
-                _atualizar_job(job_id, progresso=60)
+                _atualizar_job(job_id, progresso=72)
 
                 dados_setor = client.buscar_dados_setor(contrato_id, setor_codigo, setor_descricao)
                 codigo_setor = dados_setor["codigo_setor"]
-                _atualizar_job(job_id, progresso=68)
+                _atualizar_job(job_id, progresso=78)
 
                 hist_exc = client.inativar_e_excluir_rotas_antigas(codigo_setor)
-                _atualizar_job(job_id, progresso=78)
+                _atualizar_job(job_id, progresso=84)
 
                 cod_macro = None
                 macro_alvo = _norm_txt(macro_setor or dados_setor.get("macro_setor"))
@@ -1549,7 +2623,7 @@ def iniciar_job_publicacao_inlog(
                     apelido_rota=apelido_rota,
                     codigo_macro_setor=cod_macro,
                 )
-                _atualizar_job(job_id, progresso=88)
+                _atualizar_job(job_id, progresso=90)
 
                 info_final = client.aguardar_e_ativar_nova_rota(codigo_setor, nova_rota_id)
                 codigo_rota_ativa = int((info_final or {}).get("CodigoRota") or nova_rota_id)
@@ -1572,6 +2646,8 @@ def iniciar_job_publicacao_inlog(
                     f"Rota {setor_codigo} convertida (.shp) e publicada automaticamente em {datetime.now().strftime('%d/%m/%Y %H:%M')}. "
                     f"Trechos SHP: {resumo_conv['trechos_shapefile']} (Coleta {resumo_conv['km_coleta']} km | Desloc. {resumo_conv['km_deslocamento']} km)."
                 )
+                if res_gis:
+                    nota_auto += f" GIS Eyes atualizado ({res_gis.get('operacao')})."
                 if res_inlog:
                     nota_auto += f" Inlog CodigoRota={res_inlog['codigo_rota_nova']} (Status: {(res_inlog['rota_inlog'] or {}).get('Status', 'Ativa')})."
                 concluir_solicitacao_fn(sol_id, nota_auto)
@@ -1584,7 +2660,10 @@ def iniciar_job_publicacao_inlog(
                 resultado={
                     "sucesso": True,
                     "zip_filename": conv["zip_filename"],
+                    "zip_setor_filename": conv_setor["zip_filename"],
                     "conversao": resumo_conv,
+                    "setor_shp": resumo_setor,
+                    "giseyes": res_gis,
                     "sistema_local": res_local,
                     "inlog": res_inlog,
                 },
@@ -1618,6 +2697,8 @@ def obter_status_job_publicacao(job_id: str) -> Optional[Dict[str, Any]]:
             "resultado": job["resultado"],
             "tem_zip": job["zip_bytes"] is not None,
             "zip_filename": job["zip_filename"],
+            "tem_zip_setor": job.get("zip_setor_bytes") is not None,
+            "zip_setor_filename": job.get("zip_setor_filename"),
         }
 
 
@@ -1627,3 +2708,11 @@ def obter_zip_job_publicacao(job_id: str) -> Optional[Tuple[bytes, str]]:
         if not job or not job["zip_bytes"]:
             return None
         return job["zip_bytes"], job["zip_filename"] or "rotas.zip"
+
+
+def obter_zip_setor_job_publicacao(job_id: str) -> Optional[Tuple[bytes, str]]:
+    with _PUBLICACAO_LOCK:
+        job = _PUBLICACAO_JOBS.get(job_id)
+        if not job or not job.get("zip_setor_bytes"):
+            return None
+        return job["zip_setor_bytes"], job.get("zip_setor_filename") or "setor.zip"
