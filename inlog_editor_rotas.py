@@ -1309,6 +1309,20 @@ class InlogEditorRotasClient:
         self._log(f"✅ Nova rota temporária criada na Inlog (CodigoRota={nova_rota_cod}). Aguardando processamento...")
         return nova_rota_cod
 
+    def ativar_rota_mobile(self, codigo_rota: int, ativo: bool = True) -> bool:
+        """Marca ou desmarca a coluna Mobile da rota no EditorRotas da Inlog."""
+        res_mob = self._api_get(
+            "EditorRotas/AtivarDesativarRotaMobile",
+            params={"codigoRota": int(codigo_rota), "ativo": "true" if ativo else "false"},
+        )
+        ok = bool(isinstance(res_mob, dict) and res_mob.get("Sucesso"))
+        if ok:
+            self._log(f"📱 Coluna Mobile marcada com sucesso para a rota {codigo_rota}.")
+        else:
+            msg = res_mob.get("MensagemErro") if isinstance(res_mob, dict) else res_mob
+            self._log(f"⚠️ Aviso ao marcar coluna Mobile da rota {codigo_rota}: {msg}")
+        return ok
+
     def aguardar_e_ativar_nova_rota(
         self,
         codigo_setor: int,
@@ -1397,6 +1411,7 @@ class InlogEditorRotasClient:
                 if ativo_now or str(info_final.get("Status") or "") == "Ativa":
                     info_final["CodigoRota"] = cod_eff
                     info_final["RotaTemp"] = rt_now
+                    info_final["Mobile"] = self.ativar_rota_mobile(cod_eff, True)
                     self._log(
                         f"🏁 Rota {cod_eff} ATIVA na Inlog! "
                         f"Total={info_final.get('KmTotal')}, Coleta={info_final.get('KmColeta')}, Desloc.={info_final.get('KmDeslocamento')}."
