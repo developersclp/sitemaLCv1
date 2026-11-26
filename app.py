@@ -5182,11 +5182,29 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                         macro_setor=macro_setor,
                         setor_descricao_fallback=setor_desc,
                     )
+                    sync_res = None
+                    sync_logs = []
+                    sync_erro = None
+                    if bool(dados.get("sincronizar_inlog", False)):
+                        try:
+                            sync_res = inlog_editor_rotas.sincronizar_setor_inlog_remoto(
+                                contrato_id=contrato_id,
+                                setor_codigo=setor_codigo,
+                                resumo_setor=conv_s["resumo"],
+                                poligonos_int1e6=conv_s.get("poligonos_int1e6"),
+                                log_cb=sync_logs.append,
+                            )
+                        except Exception as e_sync:
+                            sync_erro = str(e_sync)
+                            sync_logs.append(f"⚠️ Aviso na pré-sincronização Inlog: {e_sync}")
                     self._send_json({
                         "sucesso": True,
                         "zip_filename": conv_s["zip_filename"],
                         "zip_base64": base64.b64encode(conv_s["zip_bytes"]).decode("ascii"),
                         "resumo": conv_s["resumo"],
+                        "sincronizacao_inlog": sync_res,
+                        "logs_sync": sync_logs,
+                        "sincronizacao_erro": sync_erro,
                     })
                     return
 
@@ -5249,6 +5267,25 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                     concluir_solicitacao_fn=correcao_rotas.concluir_solicitacao_com_nota,
                 )
                 self._send_json({"sucesso": True, **job})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        if path in ("/api/rotas/inlog/deduplicar_setor", "/api/correcao-rotas/deduplicar-setor-inlog"):
+            try:
+                contrato_id = str(dados.get("contrato_id") or "").lower().strip()
+                setor_codigo = str(dados.get("setor_codigo") or "").strip()
+                if not contrato_id or not setor_codigo:
+                    raise ValueError("Cidade e setor são obrigatórios.")
+                resumo_setor = dados.get("resumo_setor") or {}
+                logs_dedup = []
+                res_dedup = inlog_editor_rotas.sincronizar_setor_inlog_remoto(
+                    contrato_id=contrato_id,
+                    setor_codigo=setor_codigo,
+                    resumo_setor=resumo_setor if isinstance(resumo_setor, dict) else None,
+                    log_cb=logs_dedup.append,
+                )
+                self._send_json({"sucesso": True, "resultado": res_dedup, "logs": logs_dedup})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return

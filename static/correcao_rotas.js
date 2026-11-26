@@ -3069,11 +3069,15 @@
                                 contrato_id: params.contrato_id,
                                 setor_codigo: params.setor_codigo,
                                 setor_descricao_inlog: params.setor_descricao_inlog,
-                                macro_setor: params.macro_setor
+                                macro_setor: params.macro_setor,
+                                sincronizar_inlog: true
                             })
                         }).then(function (r) { return r.json(); }).then(function (convSetor) {
                             if (!convSetor || !convSetor.sucesso || !convSetor.zip_base64) {
                                 throw new Error((convSetor && convSetor.erro) || 'Falha ao gerar Shapefile do Setor.');
+                            }
+                            if (Array.isArray(convSetor.logs_sync)) {
+                                convSetor.logs_sync.forEach(function (l) { logsPreAgente.push('[SetoresBack] ' + l); });
                             }
                             if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = 'Executando clientetvt4.exe (GIS Eyes) no seu computador Windows...';
                             if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = '30%';
@@ -3097,7 +3101,31 @@
                                     throw new Error('Agente Local GIS Eyes: ' + ((agRes && agRes.erro) || 'falha desconhecida'));
                                 }
                                 atualizarLogsUI([]);
-                                return { b64: b64, atualizarNoServidor: false };
+                                return fetch('/api/rotas/inlog/deduplicar_setor', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        contrato_id: params.contrato_id,
+                                        setor_codigo: params.setor_codigo,
+                                        resumo_setor: convSetor.resumo || {}
+                                    })
+                                }).then(function (r) { return r.json(); }).then(function (ddRes) {
+                                    if (ddRes && Array.isArray(ddRes.logs)) {
+                                        ddRes.logs.forEach(function (l) { logsPreAgente.push('[Pós-GIS] ' + l); });
+                                    }
+                                    atualizarLogsUI([]);
+                                    return {
+                                        b64: b64,
+                                        atualizarNoServidor: false,
+                                        setorDescricaoAtual: (convSetor.resumo && convSetor.resumo.setor) || params.setor_descricao_inlog
+                                    };
+                                }).catch(function () {
+                                    return {
+                                        b64: b64,
+                                        atualizarNoServidor: false,
+                                        setorDescricaoAtual: (convSetor.resumo && convSetor.resumo.setor) || params.setor_descricao_inlog
+                                    };
+                                });
                             });
                         });
                     });
@@ -3109,7 +3137,7 @@
                             gpkg_base64: ctx.b64,
                             contrato_id: params.contrato_id,
                             setor_codigo: params.setor_codigo,
-                            setor_descricao_inlog: params.setor_descricao_inlog,
+                            setor_descricao_inlog: ctx.setorDescricaoAtual || params.setor_descricao_inlog,
                             macro_setor: params.macro_setor,
                             rota_nome: params.rota_nome,
                             apelido_rota: params.apelido_rota,

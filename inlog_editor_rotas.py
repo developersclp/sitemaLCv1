@@ -24,6 +24,7 @@ import ctypes.wintypes as _wt
 import glob
 import heapq
 import io
+import json
 import math
 import os
 import re
@@ -33,6 +34,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 import uuid
 import zipfile
 from collections import defaultdict
@@ -57,6 +59,7 @@ INLOG_LOGIN_URL = "https://locar.inlog.com.br/Rastreamento/Apresentacao/Autentic
 INLOG_AUTH_HOME_URL = "https://locar.inlog.com.br/Rastreamento/Apresentacao/Autenticador/"
 INLOG_VINCULO_URL = "https://locar.inlog.com.br/Rastreamento/Apresentacao/Account/AtivarVinculo"
 INLOG_EDITOR_BASE = "https://locar.inlog.com.br/Rastreamento/Apresentacao/EditorRotas/"
+INLOG_SETORES_API_BASE = "https://locar.inlog.com.br/SetoresBack/api/v1/"
 INLOG_EDITOR_API_KEY = "0ff6134bec254f9ba1f96d15082d20f2"
 
 INLOG_DEFAULT_USER = os.getenv("INLOG_WEB_USER", "carlos.dorth").strip()
@@ -1285,13 +1288,28 @@ def gerar_shapefile_setor_zip(
         else:
             gdf_31985 = gdf_orig.copy()
 
+        # Ordena priorizando linhas com seq_id numérico válido antes de deduplicar por par (u, v)
+        if "seq_id" in gdf_31985.columns:
+            seq_num = pd.to_numeric(gdf_31985["seq_id"], errors="coerce")
+            gdf_iter = (
+                gdf_31985.assign(
+                    _seq_na=seq_num.isna(),
+                    _seq_val=seq_num,
+                    _orig_idx=np.arange(len(gdf_31985)),
+                )
+                .sort_values(by=["_seq_na", "_seq_val", "_orig_idx"], ascending=[True, True, True])
+                .drop(columns=["_seq_na", "_seq_val", "_orig_idx"])
+            )
+        else:
+            gdf_iter = gdf_31985
+
         # Deduplicação por par (u, v) não dirigido e extração das linhas válidas
         seen_uv: Set[Tuple[int, int]] = set()
         geoms_31985: List[Any] = []
         seg_meta: List[Tuple[int, bool]] = []
         seq_counter = 0
 
-        for _, row in gdf_31985.iterrows():
+        for _, row in gdf_iter.iterrows():
             gm = row.geometry
             if gm is None or gm.is_empty:
                 continue
@@ -1383,6 +1401,16 @@ def gerar_shapefile_setor_zip(
             raise ValueError("Nenhuma geometria poligonal pôde ser gerada para o setor.")
 
         gdf_out = gpd.GeoDataFrame(feat_rows, geometry="geometry", crs="EPSG:31985").to_crs("EPSG:4326")
+        poligonos_int1e6: List[List[Tuple[int, int]]] = []
+        for gm_4326 in gdf_out.geometry:
+            if gm_4326 is None or gm_4326.is_empty:
+                continue
+            polys_part = list(gm_4326.geoms) if gm_4326.geom_type == "MultiPolygon" else [gm_4326]
+            for p_part in polys_part:
+                coords_ring = [(int(round(y * 1_000_000)), int(round(x * 1_000_000))) for x, y in p_part.exterior.coords]
+                if len(coords_ring) >= 3:
+                    poligonos_int1e6.append(coords_ring)
+
         out_dir = os.path.join(tmpdir, pasta_contrato)
         os.makedirs(out_dir, exist_ok=True)
         shp_stem = f"Setor - {base_nick}"
@@ -1407,6 +1435,7 @@ def gerar_shapefile_setor_zip(
             "zip_filename": f"Setor - {base_nick}.zip",
             "shp_stem": shp_stem,
             "pasta_contrato": pasta_contrato,
+            "poligonos_int1e6": poligonos_int1e6,
             "resumo": {
                 "setor": setor_full,
                 "apelido": base_nick,
@@ -2123,6 +2152,7 @@ class InlogEditorRotasClient:
         }
         self._log_cb = log_cb
         self.vinculos: List[Tuple[str, str]] = []
+        self._vinculo_ativo_contrato: Optional[str] = None
 
     def _log(self, msg: str) -> None:
         if self._log_cb:
@@ -2212,6 +2242,7 @@ class InlogEditorRotasClient:
         # Abre a página do EditorRotas para consolidar cookies/sessão do módulo
         r_ed = self.session.get(INLOG_EDITOR_BASE, timeout=25)
         r_ed.raise_for_status()
+        self._vinculo_ativo_contrato = cid
         self._log(f"✅ Cidade '{v_label}' ativada e Editor de Rotas carregado.")
         return v_id, v_label
 
@@ -2521,6 +2552,395 @@ class InlogEditorRotasClient:
         self._log(f"⚠️ Ativação enviada; status atual retornado pela Inlog: {info_final.get('Status')} (Ativo={info_final.get('Ativo')}).")
         return info_final
 
+    # --------------------------------------------------------------------------
+    # API SetoresBack (Editor de Setores Inlog — Anti-duplicação & Alteração)
+    # --------------------------------------------------------------------------
+    def _obter_headers_setores_back(self) -> Dict[str, str]:
+        raw_cookie = None
+        for ck in self.session.cookies:
+            if ck.name == "Inlog.Autenticador.PublicToken" and ck.value:
+                raw_cookie = ck.value
+                break
+        if not raw_cookie:
+            raw_cookie = self.session.cookies.get("Inlog.Autenticador.PublicToken")
+        if not raw_cookie:
+            raise RuntimeError("Cookie 'Inlog.Autenticador.PublicToken' não encontrado após login na Inlog.")
+        decoded = urllib.parse.unquote(raw_cookie)
+        try:
+            tok = json.loads(decoded).get("token")
+        except Exception as exc:
+            raise RuntimeError(f"Token do cookie PublicToken inválido: {exc}") from exc
+        if not tok:
+            raise RuntimeError("Campo 'token' ausente em Inlog.Autenticador.PublicToken.")
+        return {
+            "Authorization": tok,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+    def _setores_api_req(
+        self,
+        method: str,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Any = None,
+        timeout: int = 30,
+    ) -> Any:
+        url = INLOG_SETORES_API_BASE + action.lstrip("/")
+        headers = self._obter_headers_setores_back()
+        resp = self.session.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            json=json_body,
+            headers=headers,
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"SetoresBack HTTP {resp.status_code} em {action}: {resp.text[:500]}")
+        if not resp.text.strip():
+            return {}
+        try:
+            return resp.json()
+        except ValueError:
+            return {"raw_text": resp.text}
+
+    def _city_prefixes_for_contract(self, contrato_id: str) -> List[str]:
+        cid = _norm_txt(contrato_id).lower()
+        cid_sp = cid.replace("_", " ")
+        prefixes: List[str] = []
+        for al in CONTRATO_VINCULO_ALIASES.get(cid, []) + CONTRATO_VINCULO_ALIASES.get(cid_sp, []):
+            na = _norm_txt(al)
+            if na and na not in prefixes:
+                prefixes.append(na)
+        cfg = CONTRATOS_SETORES_CFG.get(cid) or CONTRATOS_SETORES_CFG.get(cid_sp)
+        if cfg and _norm_txt(cfg[2]) not in prefixes:
+            prefixes.append(_norm_txt(cfg[2]))
+        if _norm_txt(cid_sp) and _norm_txt(cid_sp) not in prefixes:
+            prefixes.append(_norm_txt(cid_sp))
+        return prefixes
+
+    @staticmethod
+    def _weekdays_set(texto: Any) -> Set[str]:
+        return set(_SECTOR_WEEKDAY_RE.findall(_norm_txt(texto)))
+
+    def buscar_setores_setoresback(
+        self,
+        contrato_id: str,
+        setor_codigo: str,
+        identif: Optional[str] = None,
+        incluir_inativos: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Busca no SetoresBack todos os setores pertencentes ao contrato/cidade e ao
+        mesmo código canônico ou IDENTIF (evitando colisões entre cidades distintas).
+        """
+        cod_canon = malha_rotas.extrair_codigo_setor(setor_codigo)
+        city_prefixes = self._city_prefixes_for_contract(contrato_id)
+        identif_str = str(identif or "").strip()
+        prefix3 = identif_str[:3] if len(identif_str) >= 3 and identif_str[:3].isdigit() else ""
+
+        queries: List[str] = []
+        if cod_canon:
+            pfx, num = cod_canon
+            num_z = str(num).zfill(2)
+            for q in (f"{pfx} {num}", f"{pfx} {num_z}", f"{pfx}{num}", f"{pfx}{num_z}"):
+                if q not in queries:
+                    queries.append(q)
+        raw_sc = str(setor_codigo or "").strip()
+        if raw_sc and raw_sc not in queries:
+            queries.append(raw_sc)
+        for cp in city_prefixes[:1]:
+            if cp and cp not in queries:
+                queries.append(cp)
+
+        candidatos_por_cod: Dict[int, Dict[str, Any]] = {}
+        setor_norm = _norm_txt(setor_codigo)
+        for q in queries:
+            try:
+                res = self._setores_api_req("GET", "Setor", params={"query": q}, timeout=25)
+            except Exception:
+                continue
+            items = res.get("data") if isinstance(res, dict) else res
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                cod = it.get("codigo")
+                if not cod:
+                    continue
+                cod_i = int(cod)
+                desc_it = _norm_txt(it.get("descricao"))
+                ap_it = _norm_txt(it.get("apelido"))
+                # Pré-filtro por código canônico ou apelido/descrição compatível
+                matches_code = False
+                if cod_canon:
+                    if malha_rotas.extrair_codigo_setor(desc_it) == cod_canon or malha_rotas.extrair_codigo_setor(ap_it) == cod_canon:
+                        matches_code = True
+                if not matches_code and setor_norm:
+                    if setor_norm == ap_it or setor_norm in desc_it:
+                        matches_code = True
+                if not matches_code:
+                    continue
+                # Pré-filtro rápido se a descrição já começa explicitamente com OUTRA cidade conhecida
+                if " - " in desc_it and city_prefixes:
+                    desc_city = desc_it.split(" - ", 1)[0].strip()
+                    if desc_city and not any(desc_city.startswith(cp) or cp in desc_city for cp in city_prefixes):
+                        continue
+                candidatos_por_cod[cod_i] = it
+
+        # Carrega detalhes completos para confirmar cidade, macroSetor, identificador e dias
+        target_days = self._weekdays_set(setor_codigo)
+        confirmados: List[Dict[str, Any]] = []
+        for cod_i in sorted(candidatos_por_cod.keys()):
+            try:
+                det_resp = self._setores_api_req("GET", "Setor/Detalhes", params={"Codigo": cod_i}, timeout=25)
+            except Exception:
+                continue
+            det = det_resp.get("data") if isinstance(det_resp, dict) and isinstance(det_resp.get("data"), dict) else det_resp
+            if not isinstance(det, dict) or not det.get("codigo"):
+                continue
+
+            if not incluir_inativos and str(det.get("inativo") or "F").upper() == "T":
+                continue
+
+            det_desc = _norm_txt(det.get("descricao"))
+            det_macro = _norm_txt(det.get("macroSetor"))
+            det_ident = str(det.get("identificador") or "").strip()
+
+            # Guarda 1: cidade / contrato
+            city_ok = False
+            if city_prefixes:
+                if any(det_desc.startswith(cp) or f" - {cp}" in det_desc for cp in city_prefixes):
+                    city_ok = True
+                elif any(det_macro.startswith(cp) or cp in det_macro for cp in city_prefixes):
+                    city_ok = True
+            else:
+                city_ok = True
+            if not city_ok:
+                continue
+
+            # Guarda 2: prefixo de 3 dígitos do IDENTIF (ex.: '007' Garanhuns vs '011' Várzea Grande)
+            if prefix3 and len(det_ident) >= 3 and det_ident[:3].isdigit() and det_ident[:3] != prefix3:
+                continue
+
+            # Guarda 3: conflito explícito de dia da semana no nome do setor (ex.: SEG vs TER)
+            if target_days:
+                head_desc = det_desc.split(" - ", 2)
+                cand_head = head_desc[1] if len(head_desc) > 1 else det_desc
+                cand_days = self._weekdays_set(cand_head) or self._weekdays_set(det.get("apelido"))
+                if cand_days and target_days.isdisjoint(cand_days):
+                    continue
+
+            # Confirma correspondência de código canônico OU identificador exato na mesma cidade
+            det_canon_desc = malha_rotas.extrair_codigo_setor(det_desc)
+            det_canon_ap = malha_rotas.extrair_codigo_setor(det.get("apelido"))
+            same_ident = bool(identif_str and det_ident == identif_str)
+            same_canon = bool(cod_canon and (det_canon_desc == cod_canon or det_canon_ap == cod_canon))
+            if not (same_ident or same_canon):
+                continue
+
+            confirmados.append(det)
+
+        return confirmados
+
+    def _contar_rotas_setor_setoresback(self, codigo_setor: int) -> int:
+        try:
+            r = self._setores_api_req("GET", "Setor/Rotas", params={"CodigoSetor": int(codigo_setor)}, timeout=20)
+            items = r.get("data") if isinstance(r, dict) else r
+            if isinstance(items, list):
+                return len([x for x in items if str(x.get("apagado") or x.get("Apagado") or "F").upper() != "T"])
+        except Exception:
+            pass
+        return 0
+
+    def sincronizar_e_deduplicar_setor_inlog(
+        self,
+        contrato_id: str,
+        setor_codigo: str,
+        resumo_setor: Optional[Dict[str, Any]] = None,
+        poligonos_int1e6: Optional[List[List[Tuple[int, int]]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Garante que exista apenas UM setor ativo na Inlog para (contrato_id, setor_codigo/IDENTIF)
+        e sincroniza `descricao` (= SETOR do shapefile), `identificador`, `frequencia` e
+        polígonos (`areas`) via API `SetoresBack/api/v1/Setor/Alterar`.
+
+        Como o GIS Eyes (clientetvt4.exe) localiza setores existentes exclusivamente por
+        `DESCRICAO;MACROSETOR`, alinhar a descrição do setor existente ANTES da importação
+        no GIS Eyes evita que um setor alterado crie um registro duplicado. Após o GIS Eyes,
+        uma segunda chamada remove imediatamente qualquer eventual duplicata residual.
+        """
+        resumo_setor = dict(resumo_setor or {})
+        identif = str(resumo_setor.get("identif") or "").strip()
+        if not identif:
+            cfg = CONTRATOS_SETORES_CFG.get(str(contrato_id or "").lower().strip()) or CONTRATOS_SETORES_CFG.get(
+                str(contrato_id or "").lower().strip().replace("_", " ")
+            )
+            if cfg:
+                m_c = re.search(r"(\d+)\s*$", setor_codigo) or re.search(r"(\d+)", setor_codigo)
+                if m_c:
+                    identif = f"{cfg[0]}{m_c.group(1)}"
+
+        candidatos = self.buscar_setores_setoresback(contrato_id, setor_codigo, identif=identif)
+        if not candidatos:
+            self._log(
+                f"ℹ️ Nenhum setor pré-existente encontrado no SetoresBack para '{setor_codigo}' ({contrato_id}); "
+                "o GIS Eyes criará o cadastro inicial."
+            )
+            return {
+                "encontrados": 0,
+                "codigo_principal": None,
+                "duplicatas_removidas": [],
+                "duplicatas_inativadas": [],
+                "alterado": False,
+            }
+
+        # Ordena mantendo o registro que possui rotas vinculadas e menor codigo (original)
+        candidatos_ord = sorted(
+            candidatos,
+            key=lambda d: (0 if self._contar_rotas_setor_setoresback(int(d["codigo"])) > 0 else 1, int(d["codigo"])),
+        )
+        principal = dict(candidatos_ord[0])
+        cod_principal = int(principal["codigo"])
+        duplicatas = candidatos_ord[1:]
+
+        dups_removidas: List[int] = []
+        dups_inativadas: List[int] = []
+
+        for dup in duplicatas:
+            cod_dup = int(dup["codigo"])
+            desc_dup = str(dup.get("descricao") or cod_dup)
+            self._log(f"🧹 Removendo setor duplicado na Inlog: Codigo={cod_dup} ('{desc_dup}')...")
+            removido = False
+            try:
+                res_del = self._setores_api_req("DELETE", "Setor/Delete", params={"Codigo": cod_dup}, timeout=30)
+                if not isinstance(res_del, dict) or res_del.get("success", True) is not False:
+                    removido = True
+            except Exception:
+                removido = False
+
+            if not removido:
+                # Se possui rota ou histórico impedindo Delete direto, tenta limpar rotas e repetir Delete
+                try:
+                    if self._vinculo_ativo_contrato != _norm_txt(contrato_id).lower():
+                        self.ativar_vinculo_cidade(contrato_id)
+                    self.inativar_e_excluir_rotas_antigas(cod_dup)
+                    res_del2 = self._setores_api_req("DELETE", "Setor/Delete", params={"Codigo": cod_dup}, timeout=30)
+                    if not isinstance(res_del2, dict) or res_del2.get("success", True) is not False:
+                        removido = True
+                except Exception:
+                    removido = False
+
+            if removido:
+                dups_removidas.append(cod_dup)
+                self._log(f"✅ Duplicata Codigo={cod_dup} excluída definitivamente da Inlog.")
+            else:
+                try:
+                    self._setores_api_req("DELETE", "Setor/Inativar", params={"Codigo": cod_dup}, timeout=30)
+                    dups_inativadas.append(cod_dup)
+                    self._log(f"⚠️ Duplicata Codigo={cod_dup} possuía vínculos históricos e foi INATIVADA.")
+                except Exception as exc_in:
+                    self._log(f"⚠️ Não foi possível remover/inativar duplicata Codigo={cod_dup}: {exc_in}")
+
+        # Atualiza descrição, atributos e áreas do setor principal via PUT /Setor/Alterar
+        nova_desc = str(resumo_setor.get("setor") or "").strip()[:_SECTOR_NAME_MAX_LEN]
+        nova_freq = str(resumo_setor.get("frequencia") or "").strip()
+        novo_macro_norm = _norm_txt(resumo_setor.get("macro"))
+        desc_antes = str(principal.get("descricao") or "").strip()
+
+        precisa_alterar = bool(
+            (nova_desc and nova_desc != desc_antes)
+            or (identif and str(principal.get("identificador") or "").strip() != identif)
+            or (nova_freq and str(principal.get("frequencia") or "").strip() != nova_freq)
+            or (poligonos_int1e6 and len(poligonos_int1e6) > 0)
+        )
+
+        alterado_ok = False
+        if precisa_alterar:
+            payload = dict(principal)
+            if nova_desc:
+                payload["descricao"] = nova_desc
+            if identif:
+                payload["identificador"] = identif[:20]
+            if nova_freq:
+                payload["frequencia"] = nova_freq
+            if not str(payload.get("apelido") or "").strip():
+                ap_base = str(resumo_setor.get("apelido") or setor_codigo or "").strip()
+                if ap_base:
+                    payload["apelido"] = ap_base[:10]
+
+            if novo_macro_norm and _norm_txt(payload.get("macroSetor")) != novo_macro_norm:
+                try:
+                    m_res = self._setores_api_req("GET", "MacroSetor/Listar", params={"Skip": 0, "Take": -1}, timeout=25)
+                    macros = m_res.get("data") if isinstance(m_res, dict) else m_res
+                    for m_it in macros or []:
+                        if _norm_txt(m_it.get("descricao")) == novo_macro_norm:
+                            payload["codigoMacroSetor"] = int(m_it["codigo"])
+                            payload["macroSetor"] = str(m_it["descricao"])
+                            break
+                except Exception:
+                    pass
+
+            if poligonos_int1e6:
+                payload["areas"] = [
+                    {
+                        "codigo": 0,
+                        "descricao": f"AREA {idx_a}",
+                        "codigoSetor": cod_principal,
+                        "latitude": 0,
+                        "longitude": 0,
+                        "setorAreaCoordenadas": [
+                            {"codigo": 0, "latitude": int(lat_i), "longitude": int(lng_i)}
+                            for lat_i, lng_i in ring
+                        ],
+                    }
+                    for idx_a, ring in enumerate(poligonos_int1e6, start=1)
+                ]
+                payload["areasAlteradas"] = True
+            else:
+                payload["areasAlteradas"] = False
+
+            res_alt = self._setores_api_req("PUT", "Setor/Alterar", json_body=payload, timeout=45)
+            if isinstance(res_alt, dict) and res_alt.get("success") is False:
+                raise RuntimeError(f"SetoresBack rejeitou Alterar do setor {cod_principal}: {res_alt.get('message') or res_alt}")
+            alterado_ok = True
+            self._log(
+                f"🔄 Setor Codigo={cod_principal} sincronizado no SetoresBack Inlog "
+                f"(Descrição='{payload.get('descricao')}', Áreas={len(payload.get('areas') or [])})."
+            )
+        else:
+            self._log(f"✅ Setor Codigo={cod_principal} já está único e sincronizado no SetoresBack Inlog.")
+
+        return {
+            "encontrados": len(candidatos),
+            "codigo_principal": cod_principal,
+            "descricao_anterior": desc_antes,
+            "descricao_atual": nova_desc or desc_antes,
+            "duplicatas_removidas": dups_removidas,
+            "duplicatas_inativadas": dups_inativadas,
+            "alterado": alterado_ok,
+        }
+
+
+def sincronizar_setor_inlog_remoto(
+    contrato_id: str,
+    setor_codigo: str,
+    resumo_setor: Optional[Dict[str, Any]] = None,
+    poligonos_int1e6: Optional[List[List[Tuple[int, int]]]] = None,
+    usuario_inlog: Optional[str] = None,
+    senha_inlog: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Atalho autenticado para sincronizar/deduplicar setor na Inlog fora de um job ativo."""
+    client = InlogEditorRotasClient(log_cb=log_cb)
+    client.login(usuario_inlog or INLOG_DEFAULT_USER, senha_inlog or INLOG_DEFAULT_PASS)
+    return client.sincronizar_e_deduplicar_setor_inlog(
+        contrato_id=contrato_id,
+        setor_codigo=setor_codigo,
+        resumo_setor=resumo_setor,
+        poligonos_int1e6=poligonos_int1e6,
+    )
+
 
 # ==============================================================================
 # GERENCIADOR DE JOBS ASSÍNCRONOS PARA UI
@@ -2631,6 +3051,24 @@ def iniciar_job_publicacao_inlog(
             )
 
             res_gis = None
+            res_sync_setor = None
+            client: Optional[InlogEditorRotasClient] = None
+            if atualizar_setor_gis or publicar_inlog:
+                client = InlogEditorRotasClient(log_cb=lambda m: _log_job(job_id, m))
+                client.login(usuario_inlog or INLOG_DEFAULT_USER, senha_inlog or INLOG_DEFAULT_PASS)
+                _atualizar_job(job_id, progresso=33)
+                try:
+                    _log_job(job_id, f"🔄 Sincronizando setor '{setor_codigo}' na Inlog (SetoresBack) antes do GIS Eyes...")
+                    res_sync_setor = client.sincronizar_e_deduplicar_setor_inlog(
+                        contrato_id=contrato_id,
+                        setor_codigo=setor_codigo,
+                        resumo_setor=resumo_setor,
+                        poligonos_int1e6=conv_setor.get("poligonos_int1e6"),
+                    )
+                except Exception as exc_sync:
+                    _log_job(job_id, f"⚠️ Aviso ao sincronizar setor no SetoresBack antes do GIS Eyes: {exc_sync}")
+                _atualizar_job(job_id, progresso=38)
+
             if atualizar_setor_gis:
                 if os.name != "nt" or sys.platform != "win32" or not localizar_clientetvt4_exe():
                     motivo = (
@@ -2647,6 +3085,17 @@ def iniciar_job_publicacao_inlog(
                         zip_filename=conv_setor["zip_filename"],
                         log_cb=lambda m: _log_job(job_id, m),
                     )
+                    if client is not None:
+                        try:
+                            _log_job(job_id, f"🧹 Validando ausência de duplicatas pós-GIS Eyes para '{setor_codigo}'...")
+                            res_sync_setor = client.sincronizar_e_deduplicar_setor_inlog(
+                                contrato_id=contrato_id,
+                                setor_codigo=setor_codigo,
+                                resumo_setor=resumo_setor,
+                                poligonos_int1e6=conv_setor.get("poligonos_int1e6"),
+                            )
+                        except Exception as exc_pos:
+                            _log_job(job_id, f"⚠️ Aviso na validação pós-GIS Eyes: {exc_pos}")
                 _atualizar_job(job_id, progresso=48)
 
             res_local = None
@@ -2662,14 +3111,20 @@ def iniciar_job_publicacao_inlog(
 
             res_inlog = None
             if publicar_inlog:
-                client = InlogEditorRotasClient(log_cb=lambda m: _log_job(job_id, m))
-                client.login(usuario_inlog or INLOG_DEFAULT_USER, senha_inlog or INLOG_DEFAULT_PASS)
+                if client is None:
+                    client = InlogEditorRotasClient(log_cb=lambda m: _log_job(job_id, m))
+                    client.login(usuario_inlog or INLOG_DEFAULT_USER, senha_inlog or INLOG_DEFAULT_PASS)
                 _atualizar_job(job_id, progresso=66)
 
                 v_id, v_label = client.ativar_vinculo_cidade(contrato_id)
                 _atualizar_job(job_id, progresso=72)
 
-                dados_setor = client.buscar_dados_setor(contrato_id, setor_codigo, setor_descricao)
+                desc_busca = (
+                    (res_sync_setor or {}).get("descricao_atual")
+                    or resumo_setor.get("setor")
+                    or setor_descricao
+                )
+                dados_setor = client.buscar_dados_setor(contrato_id, setor_codigo, desc_busca)
                 codigo_setor = dados_setor["codigo_setor"]
                 _atualizar_job(job_id, progresso=78)
 
@@ -2732,6 +3187,7 @@ def iniciar_job_publicacao_inlog(
                     "zip_setor_filename": conv_setor["zip_filename"],
                     "conversao": resumo_conv,
                     "setor_shp": resumo_setor,
+                    "setor_sincronizacao": res_sync_setor,
                     "giseyes": res_gis,
                     "sistema_local": res_local,
                     "inlog": res_inlog,
