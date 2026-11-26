@@ -3086,6 +3086,7 @@
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({
                                     zip_setor_base64: convSetor.zip_base64,
+                                    zip_filename: convSetor.zip_filename || '',
                                     contrato_id: params.contrato_id
                                 })
                             }).then(function (r) { return r.json(); }).then(function (agRes) {

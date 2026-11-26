@@ -20,11 +20,12 @@ import glob
 import io
 import json
 import os
+import re
 import subprocess
 import sys
-import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -78,9 +79,77 @@ def ler_colunas_dbf(shp_path: str) -> List[str]:
     return cols
 
 
+def _safe_filename(texto: str, fallback: str = "Setor.zip") -> str:
+    s = re.sub(r'[<>:"/\\|?*]+', "_", str(texto or "").strip())
+    s = re.sub(r"\s+", " ", s).strip(" .")
+    return s or fallback
+
+
+@contextmanager
+def _preparar_shape_setor_em_downloads(
+    zip_setor_bytes: bytes,
+    zip_filename: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+):
+    """
+    Salva o .zip do setor atualizado na pasta Downloads e extrai os arquivos em
+    Downloads/Setores_Inlog/<pasta>, sobrescrevendo qualquer versão antiga desse setor.
+    """
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+    extract_root = os.path.join(downloads_dir, "Setores_Inlog")
+    os.makedirs(extract_root, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(zip_setor_bytes)) as zf:
+        shp_entries = [n for n in zf.namelist() if n.lower().endswith(".shp")]
+        if not shp_entries:
+            raise RuntimeError("Nenhum arquivo .shp encontrado dentro do ZIP do setor.")
+        shp_arc = shp_entries[0]
+        shp_base = os.path.basename(shp_arc)
+        shp_stem = os.path.splitext(shp_base)[0]
+        sub_dir = os.path.dirname(shp_arc).strip("/\\")
+
+        zname = _safe_filename(zip_filename or f"{shp_stem}.zip", fallback="Setor.zip")
+        if not zname.lower().endswith(".zip"):
+            zname += ".zip"
+        zip_dl_path = os.path.join(downloads_dir, zname)
+        with open(zip_dl_path, "wb") as fz:
+            fz.write(zip_setor_bytes)
+
+        target_dir = os.path.join(extract_root, sub_dir) if sub_dir else extract_root
+        os.makedirs(target_dir, exist_ok=True)
+        for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix", ".sbn", ".sbx"):
+            old_f = os.path.join(target_dir, f"{shp_stem}{ext}")
+            if os.path.isfile(old_f):
+                try:
+                    os.remove(old_f)
+                except OSError:
+                    pass
+
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            fname = os.path.basename(member.filename)
+            if not fname:
+                continue
+            dest = os.path.join(target_dir, fname)
+            with zf.open(member, "r") as src_m, open(dest, "wb") as dst_m:
+                dst_m.write(src_m.read())
+
+        shp_dl_path = os.path.join(target_dir, shp_base)
+        if not os.path.isfile(shp_dl_path):
+            raise RuntimeError(f"Falha ao extrair '{shp_base}' em Downloads.")
+
+    if log_cb:
+        log_cb(f"💾 Shape do Setor salvo em Downloads: {zip_dl_path}")
+        log_cb(f"📂 Extraído para importação em Downloads: {shp_dl_path}")
+    yield zip_dl_path, shp_dl_path
+
+
 def atualizar_setor_clientetvt4(
     zip_setor_bytes: bytes,
     contrato_id: str,
+    zip_filename: Optional[str] = None,
     empresa: str = GISEYES_DEFAULT_EMPRESA,
     usuario: str = GISEYES_DEFAULT_USER,
     senha: str = GISEYES_DEFAULT_PASS,
@@ -183,13 +252,7 @@ def atualizar_setor_clientetvt4(
             user32.SendMessageW(combo_hwnd, WM_KEYUP, VK_DOWN, 0)
         time.sleep(0.15)
 
-    with tempfile.TemporaryDirectory(prefix="giseyes_imp_") as tmpdir:
-        with zipfile.ZipFile(io.BytesIO(zip_setor_bytes)) as zf:
-            zf.extractall(tmpdir)
-        shp_files = list(glob.iglob(os.path.join(tmpdir, "**", "*.shp"), recursive=True))
-        if not shp_files:
-            raise RuntimeError("Nenhum arquivo .shp encontrado dentro do ZIP do setor.")
-        shp_path = shp_files[0]
+    with _preparar_shape_setor_em_downloads(zip_setor_bytes, zip_filename=zip_filename, log_cb=_log) as (zip_dl_path, shp_path):
         dbf_cols = ler_colunas_dbf(shp_path)
 
         def _col_rev_idx(col_name: str) -> int:
@@ -559,6 +622,7 @@ class AgenteGisEyesHandler(BaseHTTPRequestHandler):
             dados = json.loads(body.decode("utf-8"))
             zip_b64 = str(dados.get("zip_setor_base64") or "").strip()
             contrato_id = str(dados.get("contrato_id") or "").lower().strip()
+            zip_filename = str(dados.get("zip_filename") or "").strip() or None
             if not zip_b64 or not contrato_id:
                 raise ValueError("zip_setor_base64 e contrato_id são obrigatórios.")
             zip_bytes = base64.b64decode(zip_b64)
@@ -566,6 +630,7 @@ class AgenteGisEyesHandler(BaseHTTPRequestHandler):
             res = atualizar_setor_clientetvt4(
                 zip_setor_bytes=zip_bytes,
                 contrato_id=contrato_id,
+                zip_filename=zip_filename,
                 log_cb=lambda m: (logs.append(m), print(f"[GIS Eyes] {m}", flush=True)),
             )
             self._send_json({"sucesso": True, "resultado": res, "logs": logs})

@@ -36,6 +36,7 @@ import unicodedata
 import uuid
 import zipfile
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -1448,9 +1449,73 @@ def localizar_clientetvt4_exe() -> Optional[str]:
     return None
 
 
+@contextmanager
+def _preparar_shape_setor_em_downloads(
+    zip_setor_bytes: bytes,
+    zip_filename: Optional[str] = None,
+    log_cb: Optional[Callable[[str], None]] = None,
+):
+    """
+    Salva o .zip do setor atualizado em Downloads e extrai seus arquivos em
+    Downloads/Setores_Inlog/<pasta>, sobrescrevendo qualquer versão antiga daquele setor.
+    Retorna (zip_path_downloads, shp_path_downloads).
+    """
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+    extract_root = os.path.join(downloads_dir, "Setores_Inlog")
+    os.makedirs(extract_root, exist_ok=True)
+
+    with zipfile.ZipFile(io.BytesIO(zip_setor_bytes)) as zf:
+        shp_entries = [n for n in zf.namelist() if n.lower().endswith(".shp")]
+        if not shp_entries:
+            raise RuntimeError("Nenhum arquivo .shp encontrado dentro do ZIP do setor.")
+        shp_arc = shp_entries[0]
+        shp_base = os.path.basename(shp_arc)
+        shp_stem = os.path.splitext(shp_base)[0]
+        sub_dir = os.path.dirname(shp_arc).strip("/\\")
+
+        zname = _safe_filename(zip_filename or f"{shp_stem}.zip", fallback="Setor.zip")
+        if not zname.lower().endswith(".zip"):
+            zname += ".zip"
+        zip_dl_path = os.path.join(downloads_dir, zname)
+        with open(zip_dl_path, "wb") as fz:
+            fz.write(zip_setor_bytes)
+
+        target_dir = os.path.join(extract_root, sub_dir) if sub_dir else extract_root
+        os.makedirs(target_dir, exist_ok=True)
+        # Remove versão anterior deste mesmo setor antes de extrair a nova
+        for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix", ".sbn", ".sbx"):
+            old_f = os.path.join(target_dir, f"{shp_stem}{ext}")
+            if os.path.isfile(old_f):
+                try:
+                    os.remove(old_f)
+                except OSError:
+                    pass
+
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            fname = os.path.basename(member.filename)
+            if not fname:
+                continue
+            dest = os.path.join(target_dir, fname)
+            with zf.open(member, "r") as src_m, open(dest, "wb") as dst_m:
+                dst_m.write(src_m.read())
+
+        shp_dl_path = os.path.join(target_dir, shp_base)
+        if not os.path.isfile(shp_dl_path):
+            raise RuntimeError(f"Falha ao extrair '{shp_base}' em Downloads.")
+
+    if log_cb:
+        log_cb(f"💾 Shape do Setor salvo em Downloads: {zip_dl_path}")
+        log_cb(f"📂 Extraído para importação em Downloads: {shp_dl_path}")
+    yield zip_dl_path, shp_dl_path
+
+
 def atualizar_setor_clientetvt4(
     zip_setor_bytes: bytes,
     contrato_id: str,
+    zip_filename: Optional[str] = None,
     empresa: str = GISEYES_DEFAULT_EMPRESA,
     usuario: str = GISEYES_DEFAULT_USER,
     senha: str = GISEYES_DEFAULT_PASS,
@@ -1559,13 +1624,7 @@ def atualizar_setor_clientetvt4(
             user32.SendMessageW(combo_hwnd, WM_KEYUP, VK_DOWN, 0)
         time.sleep(0.15)
 
-    with tempfile.TemporaryDirectory(prefix="giseves_imp_") as tmpdir:
-        with zipfile.ZipFile(io.BytesIO(zip_setor_bytes)) as zf:
-            zf.extractall(tmpdir)
-        shp_files = list(glob.iglob(os.path.join(tmpdir, "**", "*.shp"), recursive=True))
-        if not shp_files:
-            raise RuntimeError("Nenhum arquivo .shp encontrado dentro do ZIP do setor.")
-        shp_path = shp_files[0]
+    with _preparar_shape_setor_em_downloads(zip_setor_bytes, zip_filename=zip_filename, log_cb=_log) as (zip_dl_path, shp_path):
         gdf_meta = gpd.read_file(shp_path, rows=1)
         dbf_cols = [c for c in gdf_meta.columns if c != "geometry"]
 
@@ -2549,9 +2608,9 @@ def iniciar_job_publicacao_inlog(
                 f"{resumo_conv['lacunas_preenchidas_malha']}/{resumo_conv['lacunas_detectadas']} lacunas roteirizadas).",
             )
 
-            _log_job(job_id, f"🗺️ Gerando Shapefile do Setor ({setor_codigo})...")
+            _log_job(job_id, f"🗺️ Gerando Shapefile do Setor com base na rota editada ({setor_codigo})...")
             conv_setor = gerar_shapefile_setor_zip(
-                gpkg_bytes=conv["gpkg_corrigido_bytes"],
+                gpkg_bytes=gpkg_bytes,
                 contrato_id=contrato_id,
                 setor_codigo=setor_codigo,
                 macro_setor=macro_setor,
@@ -2585,6 +2644,7 @@ def iniciar_job_publicacao_inlog(
                     res_gis = atualizar_setor_clientetvt4(
                         zip_setor_bytes=conv_setor["zip_bytes"],
                         contrato_id=contrato_id,
+                        zip_filename=conv_setor["zip_filename"],
                         log_cb=lambda m: _log_job(job_id, m),
                     )
                 _atualizar_job(job_id, progresso=48)
