@@ -3029,19 +3029,90 @@
                 if ($('solGpkgProgLogs')) $('solGpkgProgLogs').textContent = '';
                 if ($('solGpkgProgLinks')) $('solGpkgProgLinks').innerHTML = '';
 
+                var logsPreAgente = [];
+                function atualizarLogsUI(logsSrv) {
+                    if ($('solGpkgProgLogs')) {
+                        var todos = logsPreAgente.concat(logsSrv || []);
+                        $('solGpkgProgLogs').textContent = todos.join('\n');
+                        $('solGpkgProgLogs').scrollTop = $('solGpkgProgLogs').scrollHeight;
+                    }
+                }
+
+                function checarAgenteGisLocal() {
+                    var ehLocal = (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+                    if (ehLocal || !params.atualizar_setor_gis) return Promise.resolve(false);
+                    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+                    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 1300) : null;
+                    return fetch('http://127.0.0.1:18765/health', ctrl ? { signal: ctrl.signal } : {})
+                        .then(function (r) { if (timer) clearTimeout(timer); return r.json(); })
+                        .then(function (j) { return !!(j && j.ok); })
+                        .catch(function () { if (timer) clearTimeout(timer); return false; });
+                }
+
                 blobParaBase64(params.file).then(function (b64) {
+                    return checarAgenteGisLocal().then(function (agenteAtivo) {
+                        if (!agenteAtivo) {
+                            return { b64: b64, atualizarNoServidor: params.atualizar_setor_gis };
+                        }
+                        if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = 'Agente local Windows detectado! Gerando Shape do Setor para GIS Eyes...';
+                        if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = '15%';
+                        if ($('solGpkgProgBar')) $('solGpkgProgBar').style.width = '15%';
+                        logsPreAgente.push('[Agente Local] 🖥️ Agente Windows (127.0.0.1:18765) detectado. Gerando Shape do Setor...');
+                        atualizarLogsUI([]);
+
+                        return fetch('/api/correcao-rotas/converter-gpkg-shp', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                tipo: 'setor',
+                                gpkg_base64: b64,
+                                contrato_id: params.contrato_id,
+                                setor_codigo: params.setor_codigo,
+                                setor_descricao_inlog: params.setor_descricao_inlog,
+                                macro_setor: params.macro_setor
+                            })
+                        }).then(function (r) { return r.json(); }).then(function (convSetor) {
+                            if (!convSetor || !convSetor.sucesso || !convSetor.zip_base64) {
+                                throw new Error((convSetor && convSetor.erro) || 'Falha ao gerar Shapefile do Setor.');
+                            }
+                            if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = 'Executando clientetvt4.exe (GIS Eyes) no seu computador Windows...';
+                            if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = '30%';
+                            if ($('solGpkgProgBar')) $('solGpkgProgBar').style.width = '30%';
+                            logsPreAgente.push('[Agente Local] 🚀 Enviando ' + (convSetor.zip_filename || 'setor.zip') + ' para clientetvt4.exe...');
+                            atualizarLogsUI([]);
+
+                            return fetch('http://127.0.0.1:18765/atualizar-setor', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    zip_setor_base64: convSetor.zip_base64,
+                                    contrato_id: params.contrato_id
+                                })
+                            }).then(function (r) { return r.json(); }).then(function (agRes) {
+                                if (agRes && Array.isArray(agRes.logs)) {
+                                    agRes.logs.forEach(function (l) { logsPreAgente.push('[Agente Local] ' + l); });
+                                }
+                                if (!agRes || !agRes.sucesso) {
+                                    throw new Error('Agente Local GIS Eyes: ' + ((agRes && agRes.erro) || 'falha desconhecida'));
+                                }
+                                atualizarLogsUI([]);
+                                return { b64: b64, atualizarNoServidor: false };
+                            });
+                        });
+                    });
+                }).then(function (ctx) {
                     return fetch('/api/correcao-rotas/publicar-gpkg-inlog', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            gpkg_base64: b64,
+                            gpkg_base64: ctx.b64,
                             contrato_id: params.contrato_id,
                             setor_codigo: params.setor_codigo,
                             setor_descricao_inlog: params.setor_descricao_inlog,
                             macro_setor: params.macro_setor,
                             rota_nome: params.rota_nome,
                             apelido_rota: params.apelido_rota,
-                            atualizar_setor_gis: params.atualizar_setor_gis,
+                            atualizar_setor_gis: ctx.atualizarNoServidor,
                             atualizar_local: params.atualizar_local,
                             publicar_inlog: params.publicar_inlog,
                             sol_id: params.sol_id
@@ -3065,10 +3136,7 @@
                                 if ($('solGpkgProgEtapa')) $('solGpkgProgEtapa').textContent = st.etapa_atual || '';
                                 if ($('solGpkgProgPct')) $('solGpkgProgPct').textContent = pct + '%';
                                 if ($('solGpkgProgBar')) $('solGpkgProgBar').style.width = pct + '%';
-                                if ($('solGpkgProgLogs')) {
-                                    $('solGpkgProgLogs').textContent = (st.logs || []).join('\n');
-                                    $('solGpkgProgLogs').scrollTop = $('solGpkgProgLogs').scrollHeight;
-                                }
+                                atualizarLogsUI(st.logs || []);
 
                                 if (st.status === 'CONCLUIDO' || st.status === 'ERRO') {
                                     clearInterval(_gpkgPollTimer);

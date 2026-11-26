@@ -2573,11 +2573,20 @@ def iniciar_job_publicacao_inlog(
 
             res_gis = None
             if atualizar_setor_gis:
-                res_gis = atualizar_setor_clientetvt4(
-                    zip_setor_bytes=conv_setor["zip_bytes"],
-                    contrato_id=contrato_id,
-                    log_cb=lambda m: _log_job(job_id, m),
-                )
+                if os.name != "nt" or sys.platform != "win32" or not localizar_clientetvt4_exe():
+                    motivo = (
+                        "Servidor Linux/nuvem sem acesso ao aplicativo Windows clientetvt4.exe. "
+                        "Para automatizar o GIS Eyes a partir do sistema deployado, execute 'iniciar_agente_giseyes.bat' no seu PC "
+                        "ou baixe o arquivo Shape Setor (.zip) ao final."
+                    )
+                    _log_job(job_id, f"⚠️ GIS Eyes ignorado neste servidor: {motivo}")
+                    res_gis = {"sucesso": False, "ignorado_servidor_remoto": True, "motivo": motivo}
+                else:
+                    res_gis = atualizar_setor_clientetvt4(
+                        zip_setor_bytes=conv_setor["zip_bytes"],
+                        contrato_id=contrato_id,
+                        log_cb=lambda m: _log_job(job_id, m),
+                    )
                 _atualizar_job(job_id, progresso=48)
 
             res_local = None
