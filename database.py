@@ -358,7 +358,8 @@ def liberar_espaco_emergencia_db(agressivo: bool = False) -> None:
                             TRUNCATE TABLE
                                 inlog_telemetria,
                                 inlog_alarmes,
-                                inlog_falhas
+                                inlog_falhas,
+                                painel_tempos_dia_cache
                             RESTART IDENTITY
                             """
                         )
@@ -761,6 +762,23 @@ def init_db():
                 chave TEXT PRIMARY KEY,
                 criado_em TEXT,
                 payload_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS painel_tempos_dia_cache (
+                chave TEXT PRIMARY KEY,
+                contrato_id TEXT NOT NULL,
+                data_iso TEXT NOT NULL,
+                janela_fechada INTEGER DEFAULT 0,
+                criado_em TEXT NOT NULL,
+                payload_gzip BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pt_dia_contrato ON painel_tempos_dia_cache(contrato_id, data_iso);
+
+            CREATE TABLE IF NOT EXISTS cidades_geofences (
+                contrato_id TEXT PRIMARY KEY,
+                garagens_json TEXT,
+                aterros_json TEXT,
+                atualizado_em TEXT
             );
         """
 

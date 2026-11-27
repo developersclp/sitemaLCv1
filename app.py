@@ -29,6 +29,7 @@ import database as db
 import indicadores
 import inlog_editor_rotas
 import malha_rotas
+import painel_tempos
 import snapshots
 from inlog_service import InlogService, formatar_placa_hifen, identificar_contrato
 from engine import HeatmapEngine
@@ -181,6 +182,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <!-- __SHARED_LOCK_INIT__ -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="/static/correcao_rotas.css?v=__STATIC_VER__" />
+    <link rel="stylesheet" href="/static/painel_tempos.css?v=__STATIC_VER__" />
     <script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -555,7 +557,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
         body.modo-link-compartilhado #btnCentralInlog,
         body.modo-link-compartilhado #btnSairAdmin { display: none !important; }
         body.modo-link-compartilhado #btnBaixarCsvLink { display: inline-flex !important; }
+        body.modo-link-compartilhado #btnAbrirPainelTempos { display: inline-flex !important; }
         body.modo-link-compartilhado #secCamadasInlog { display: none !important; }
+
+        .btn-painel-tempos {
+            background: linear-gradient(135deg, #0F766E, #0D9488);
+            color: #FFFFFF;
+            border: none;
+            border-radius: 5px;
+            padding: 2px 9px;
+            font-size: 0.74rem;
+            font-weight: 700;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            height: 27px;
+            transition: all 0.15s;
+            white-space: nowrap;
+            flex-shrink: 0;
+            box-shadow: 0 1px 3px rgba(15, 118, 110, 0.25);
+        }
+        .btn-painel-tempos:hover { filter: brightness(1.08); transform: translateY(-0.5px); }
 
         /* BOTÃO E CABEÇALHO MOBILE (OCULTOS NO DESKTOP) */
         .mobile-panel-toggle {
@@ -1075,6 +1098,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </button>
             <button class="btn-inlog" id="btnCentralInlog" title="Central de Módulos da API Inlog">
                 📊 Central Inlog
+            </button>
+            <button type="button" class="btn-painel-tempos" id="btnAbrirPainelTempos" title="Abrir Painel Completo de Tempos (Setores, Caminhões, Trajeto, Garagem e Aterro)">
+                ⏱️ Gestão de Tempos
             </button>
             <button type="button" class="btn-correcao-rotas" id="btnAbrirCorrecaoRotas" title="Abrir painel lateral de solicitação de correção de rotas e geração de PDF">
                 ✏️ Correção de Rotas
@@ -4162,6 +4188,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
             getAudit: () => currentAudit,
             getFeatures: () => currentFeatures,
             getSetores: () => setoresList,
+            getCidadeAtual: () => document.getElementById('selectCidade')?.value || 'cabo',
+            getDataAtual: () => document.getElementById('inputData')?.value || '',
+            getCidadesMapa: () => CIDADES_MAPA,
+            isSharedLink: () => isSharedLinkMode,
+            getSharedAuth: () => ({
+                snapshot_id: sharedSnapshotId,
+                token: sharedToken,
+                cidade: document.getElementById('selectCidade')?.value || ''
+            }),
             getSharedInfo: () => ({
                 isSharedLink: isSharedLinkMode,
                 snapshotId: sharedSnapshotId,
@@ -4195,6 +4230,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         };
     </script>
     <script src="/static/correcao_rotas.js?v=__STATIC_VER__"></script>
+    <script src="/static/painel_tempos.js?v=__STATIC_VER__"></script>
 </body>
 </html>
 """
@@ -4285,11 +4321,53 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
         proto = self.headers.get("X-Forwarded-Proto", "").lower()
         return proto == "https"
 
+    def _resolver_acesso_painel_tempos(self, query: Dict[str, list], dados: Optional[Dict[str, Any]] = None):
+        """
+        Garante isolamento estrito por cidade nos links compartilhados (/v/<id> ou token):
+          - Admin autenticado pode consultar qualquer cidade solicitada.
+          - Visitante em link compartilhado só pode consultar a cidade vinculada ao seu link/snapshot/token.
+          - Visitante sem autenticação/link recebe acesso negado.
+        """
+        is_admin, viewer_lock, _ = self._obter_sessao()
+        snap_req = ""
+        tok_req = ""
+        cidade_req = ""
+        if dados and isinstance(dados, dict):
+            snap_req = str(dados.get("snapshot_id") or "").strip()
+            tok_req = str(dados.get("token") or "").strip()
+            cidade_req = str(dados.get("cidade") or "").lower().strip()
+        if not snap_req:
+            snap_req = str(query.get("snapshot_id", [""])[0] or "").strip()
+        if not tok_req:
+            tok_req = str(query.get("token", [""])[0] or "").strip()
+        if not cidade_req:
+            cidade_req = str(query.get("cidade", [""])[0] or "").lower().strip()
+
+        if is_admin:
+            return True, (cidade_req or "cabo"), True
+
+        lock_eff = viewer_lock
+        if not lock_eff:
+            if snap_req:
+                sm = snapshots.obter_snapshot_meta(snap_req)
+                if sm:
+                    lock_eff = {"snapshot_id": sm["id"], **sm["params"]}
+            elif tok_req:
+                lock_eff = validar_token_compartilhamento(tok_req)
+
+        if lock_eff and lock_eff.get("cidade"):
+            # Nunca confia em cidade enviada pelo cliente quando não é admin
+            return True, str(lock_eff["cidade"]).lower().strip(), False
+
+        if REQUIRE_ADMIN_LOGIN:
+            return False, None, False
+        return True, (cidade_req or "cabo"), False
+
     def _render_html_com_lock(self, shared_lock: Dict[str, Any]) -> bytes:
         script_tag = f"<script>window.__SHARED_LOCK__ = {json.dumps(shared_lock, ensure_ascii=False)};</script>"
         static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
         mtimes = []
-        for fn in ("correcao_rotas.js", "correcao_rotas.css"):
+        for fn in ("correcao_rotas.js", "correcao_rotas.css", "painel_tempos.js", "painel_tempos.css"):
             fp = os.path.join(static_dir, fn)
             if os.path.isfile(fp):
                 mtimes.append(int(os.path.getmtime(fp)))
@@ -4618,6 +4696,64 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"type": "FeatureCollection", "features": [], "erro": "bbox inválido"})
                 return
             self._send_json(malha_rotas.malha_viewport(cidade_req, bbox))
+            return
+
+        # 3b-tempos. Painel Completo de Tempos Operacionais (Link da Cidade + Admin)
+        if path == "/api/painel-tempos/status":
+            ok_acesso, cidade_eff, eh_admin = self._resolver_acesso_painel_tempos(query)
+            if not ok_acesso:
+                self._send_json({"sucesso": False, "erro": "Acesso restrito ao link da cidade."}, status=403)
+                return
+            job_id = query.get("job_id", [""])[0].strip()
+            job = painel_tempos.obter_status_job_tempos(job_id)
+            if not job:
+                self._send_json({"sucesso": False, "erro": "Consulta de tempos não encontrada ou expirada."}, status=404)
+                return
+            if (not eh_admin) and str(job.get("contrato_id") or "").lower().strip() != str(cidade_eff or "").lower().strip():
+                self._send_json({"sucesso": False, "erro": "Este relatório pertence a outra cidade."}, status=403)
+                return
+            self._send_json({"sucesso": True, **job})
+            return
+
+        if path == "/api/painel-tempos/exportar-excel":
+            ok_acesso, cidade_eff, eh_admin = self._resolver_acesso_painel_tempos(query)
+            if not ok_acesso:
+                self._send_json({"sucesso": False, "erro": "Acesso restrito ao link da cidade."}, status=403)
+                return
+            job_id = query.get("job_id", [""])[0].strip()
+            dados_exp = None
+            if job_id:
+                job = painel_tempos.obter_status_job_tempos(job_id)
+                if job and job.get("status") == "done" and job.get("resultado"):
+                    if (not eh_admin) and str(job.get("contrato_id") or "").lower().strip() != str(cidade_eff or "").lower().strip():
+                        self._send_json({"sucesso": False, "erro": "Este relatório pertence a outra cidade."}, status=403)
+                        return
+                    dados_exp = job["resultado"]
+            if dados_exp is None:
+                modo = str(query.get("modo", ["dia"])[0] or "dia").lower().strip()
+                data_s = query.get("data", [None])[0]
+                mes_s = query.get("mes", [None])[0]
+                try:
+                    if modo == "mes":
+                        dados_exp = painel_tempos.consolidar_painel_mes_cidade(engine, cidade_eff, mes_str=mes_s, data_str=data_s)
+                    else:
+                        per = painel_tempos.resolver_periodo_tempos("dia", data_str=data_s)
+                        dados_exp = painel_tempos.calcular_painel_dia_cidade(engine, cidade_eff, per["data_inicial_iso"])
+                except Exception as e:
+                    self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+                    return
+
+            xlsx_bytes, filename = painel_tempos.gerar_excel_painel_tempos(dados_exp)
+            safe_ascii = filename.replace('"', "")
+            quoted_utf8 = urllib.parse.quote(filename)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_ascii}"; filename*=UTF-8\'\'{quoted_utf8}')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(xlsx_bytes)))
+            self.end_headers()
+            self.wfile.write(xlsx_bytes)
             return
 
         # Demais APIs internas e Inlog: exigem sessão administrativa autenticada
@@ -5116,6 +5252,30 @@ class LocarRequestHandler(BaseHTTPRequestHandler):
                         dados["snapshot_id"] = lock_eff["snapshot_id"]
                 salvo = correcao_rotas.salvar_solicitacao(dados)
                 self._send_json({"sucesso": True, **salvo})
+            except Exception as e:
+                self._send_json({"sucesso": False, "erro": str(e)}, status=400)
+            return
+
+        # 0b-tempos. Iniciar Análise do Painel de Tempos (Link da Cidade + Admin)
+        if path == "/api/painel-tempos/iniciar":
+            ok_acesso, cidade_eff, eh_admin = self._resolver_acesso_painel_tempos(urllib.parse.parse_qs(parsed.query), dados=dados)
+            if not ok_acesso or not cidade_eff:
+                self._send_json({"sucesso": False, "erro": "Acesso restrito ao link da cidade."}, status=403)
+                return
+            try:
+                modo = str(dados.get("modo") or "dia").lower().strip()
+                data_s = dados.get("data")
+                mes_s = dados.get("mes")
+                forcar = bool(dados.get("forcar", False)) if eh_admin else False
+                res_job = painel_tempos.iniciar_job_tempos(
+                    engine=engine,
+                    contrato_id=cidade_eff,
+                    modo=modo,
+                    data_str=data_s,
+                    mes_str=mes_s,
+                    force_refresh=forcar,
+                )
+                self._send_json({"sucesso": True, **res_job})
             except Exception as e:
                 self._send_json({"sucesso": False, "erro": str(e)}, status=400)
             return
